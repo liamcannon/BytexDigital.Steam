@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -128,17 +129,41 @@ public class SteamContentClient : IAsyncDisposable
                     await SteamClient._steamContentHandler.GetManifestRequestCode(depotId, appId, manifestId)
                         .WaitAsync(cancellationToken);
 
-                var manifest =
-                    await pool.CdnClient.DownloadManifestAsync(depotId, manifestId, manifestCode, server, depotKey)
-                        .WaitAsync(cancellationToken);
+                var cdnKey = $"{(uint) depotId}:{server.Host}";
+                CdnAuthenticationTokens.TryGetValue(cdnKey, out var cdnAuth);
 
-
-                if (manifest.FilenamesEncrypted)
+                try
                 {
-                    manifest.DecryptFilenames(depotKey);
-                }
+                    var manifest =
+                        await pool.CdnClient.DownloadManifestAsync(
+                                depotId,
+                                manifestId,
+                                manifestCode,
+                                server,
+                                depotKey,
+                                cdnAuthToken: cdnAuth?.Token)
+                            .WaitAsync(cancellationToken);
 
-                return manifest;
+                    if (manifest.FilenamesEncrypted)
+                    {
+                        manifest.DecryptFilenames(depotKey);
+                    }
+
+                    return manifest;
+                }
+                catch (SteamKit.SteamKitWebRequestException ex)
+                    when (ex.StatusCode == HttpStatusCode.Forbidden && !CdnAuthenticationTokens.ContainsKey(cdnKey))
+                {
+                    var auth = await SteamClient._steamContentHandler.GetCDNAuthToken(appId, depotId, server.Host)
+                        .WaitAsync(cancellationToken);
+                    if (auth.Result == SteamKit.EResult.OK)
+                    {
+                        CdnAuthenticationTokens.TryAdd(cdnKey, auth);
+                    }
+
+                    lastException = ex;
+                    continue;
+                }
             }
             catch (SteamAccessDeniedException)
             {
