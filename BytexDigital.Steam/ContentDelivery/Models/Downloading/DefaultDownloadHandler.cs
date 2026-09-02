@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
@@ -11,6 +12,7 @@ using BytexDigital.Steam.ContentDelivery.Exceptions;
 using BytexDigital.Steam.Core.Structs;
 using Microsoft.Extensions.Logging;
 using Nito.AsyncEx;
+using SteamKit2;
 using SteamKit2.CDN;
 using static SteamKit2.DepotManifest;
 
@@ -407,16 +409,35 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 {
                     server = _serverPool.GetServer(cancellationToken);
 
+                    var cdnKey = $"{(uint) DepotId}:{server.Host}";
+                    _steamContentClient.CdnAuthenticationTokens.TryGetValue(cdnKey, out var cdnAuth);
+
                     writtenBytes = await _serverPool.CdnClient.DownloadDepotChunkAsync(
                             DepotId,
                             chunkJob.InternalChunk,
                             server,
                             downloadedData,
                             _depotKey,
-                            _serverPool.DesignatedProxyServer)
+                            _serverPool.DesignatedProxyServer,
+                            cdnAuth?.Token)
                         .ConfigureAwait(false);
 
                     downloadSuccess = true;
+                }
+                catch (SteamKitWebRequestException ex)
+                    when (ex.StatusCode == HttpStatusCode.Forbidden &&
+                          !_steamContentClient.CdnAuthenticationTokens.ContainsKey($"{(uint) DepotId}:{server.Host}"))
+                {
+                    var auth = await _steamContentClient.SteamClient._steamContentHandler
+                        .GetCDNAuthToken(AppId, DepotId, server.Host)
+                        .ConfigureAwait(false);
+                    if (auth.Result == EResult.OK)
+                    {
+                        _steamContentClient.CdnAuthenticationTokens.TryAdd($"{(uint) DepotId}:{server.Host}", auth);
+                    }
+
+                    _serverPool.ReturnServer(server, false);
+                    server = null;
                 }
                 catch (Exception ex)
                 {
