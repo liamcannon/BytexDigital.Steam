@@ -50,19 +50,19 @@ public class SteamContentClient : IAsyncDisposable
     public CancellationToken CancellationToken => _cancellationTokenSource.Token;
     public SteamClient SteamClient { get; }
 
-    internal SteamKit.SteamUnifiedMessages.UnifiedService<IPublishedFile> PublishedFileService { get; }
+    internal SteamKit.Internal.PublishedFile PublishedFileService { get; }
     internal SteamKit.SteamUser SteamUser { get; }
     internal SteamKit.SteamApps SteamApps { get; }
     internal SteamKit.SteamUnifiedMessages SteamUnifiedMessagesService { get; }
-    internal ConcurrentDictionary<string, SteamKit.SteamApps.CDNAuthTokenCallback> CdnAuthenticationTokens { get; }
+    internal ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken> CdnAuthenticationTokens { get; }
     internal int MaxConcurrentDownloadsPerTask { get; }
 
     public SteamContentClient(SteamClient steamClient, int maxConcurrentDownloadsPerTask = 10)
     {
         SteamClient = steamClient;
         SteamUnifiedMessagesService = SteamClient.InternalClient.GetHandler<SteamKit.SteamUnifiedMessages>();
-        PublishedFileService = SteamUnifiedMessagesService.CreateService<IPublishedFile>();
-        CdnAuthenticationTokens = new ConcurrentDictionary<string, SteamKit.SteamApps.CDNAuthTokenCallback>();
+        PublishedFileService = SteamUnifiedMessagesService.CreateService<PublishedFile>();
+        CdnAuthenticationTokens = new ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken>();
         MaxConcurrentDownloadsPerTask = maxConcurrentDownloadsPerTask;
         SteamApps = SteamClient.InternalClient.GetHandler<SteamKit.SteamApps>();
         SteamUser = SteamClient.InternalClient.GetHandler<SteamKit.SteamUser>();
@@ -238,9 +238,12 @@ public class SteamContentClient : IAsyncDisposable
     {
         var request = new CPublishedFile_GetDetails_Request();
 
-        publishedFileIds.ToList().ForEach(x => request.publishedfileids.Add(x));
+        foreach (var publishedFileId in publishedFileIds)
+        {
+            request.publishedfileids.Add(publishedFileId);
+        }
 
-        var result = await PublishedFileService.SendMessage(api => api.GetDetails(request))
+        var result = await PublishedFileService.GetDetails(request)
             .ToTask()
             .WaitAsync(cancellationToken);
 
@@ -249,10 +252,7 @@ public class SteamContentClient : IAsyncDisposable
             throw new SteamPublishedFileDetailsFetchException(result.Result);
         }
 
-        var details = result.GetDeserializedResponse<CPublishedFile_GetDetails_Response>()
-            .publishedfiledetails;
-
-        return details;
+        return result.Body.publishedfiledetails;
     }
 
     public async Task<IList<PublishedFileDetails>> GetPublishedFilesForAppIdRawAsync(
@@ -283,11 +283,11 @@ public class SteamContentClient : IAsyncDisposable
                 return_short_description = true
             };
 
-            var methodResponse = await PublishedFileService.SendMessage(api => api.QueryFiles(requestDetails))
+            var methodResponse = await PublishedFileService.QueryFiles(requestDetails)
                 .ToTask()
                 .WaitAsync(cancellationToken);
 
-            var returnedItems = methodResponse.GetDeserializedResponse<CPublishedFile_QueryFiles_Response>();
+            var returnedItems = methodResponse.Body;
 
             items.AddRange(returnedItems.publishedfiledetails);
             paginationCursor = returnedItems.next_cursor;
