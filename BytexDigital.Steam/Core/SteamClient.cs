@@ -156,6 +156,8 @@ namespace BytexDigital.Steam.Core
 
             FaultException ??= new SteamClientDisposedException();
 
+            // The callback loop stops with the token, so OnDisconnected never gets to do this
+            _clientReadyEvent.Reset();
             _clientFaultedEvent.Set();
             _cancellationTokenSource.Cancel();
 
