@@ -108,14 +108,14 @@ public class SteamContentClient : IAsyncDisposable
         ManifestId manifestId,
         CancellationToken cancellationToken = default)
     {
-        await SteamClient.AwaitReadyAsync(cancellationToken);
-
-        var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
-
         if (manifestId == default)
         {
             throw new SteamManifestDownloadException($"Manifest with id = {manifestId} cannot be downloaded.");
         }
+
+        await SteamClient.AwaitReadyAsync(cancellationToken);
+
+        var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
 
         var attempts = 0;
         const int maxAttempts = 5;
@@ -576,7 +576,11 @@ public class SteamContentClient : IAsyncDisposable
             }
         }
 
-        manifestId ??= publishedFileDetails.hcontent_file;
+        // A caller may pass default(ManifestId) to mean "not known". That is a value, not null.
+        if (!manifestId.HasValue || manifestId.Value.Id == 0)
+        {
+            manifestId = publishedFileDetails.hcontent_file;
+        }
 
         if (!manifestId.HasValue || manifestId.Value.Id == 0)
         {
