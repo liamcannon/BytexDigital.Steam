@@ -2,9 +2,9 @@ name: Build and Test
 
 on:
   push:
-    branches: [ master, FasterUpdateTesting ]
+    branches: [ master ]
   pull_request:
-    branches:
+    branches: [ FasterUpdateTesting ]
   workflow_dispatch:
 
 permissions:

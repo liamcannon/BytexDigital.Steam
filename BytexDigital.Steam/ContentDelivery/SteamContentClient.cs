@@ -178,6 +178,8 @@ public class SteamContentClient : IAsyncDisposable
             }
             catch (Exception ex) when (ex is SteamAccessDeniedException or SteamNoContentServerFoundException)
             {
+                // Neither of these says anything about the server we are holding, so it goes back as healthy
+                healthy = true;
                 throw;
             }
             catch (Exception ex)
@@ -1017,9 +1019,6 @@ public class SteamContentClient : IAsyncDisposable
         return parsedBranches;
     }
 
-    [SuppressMessage("Security", "S5542", Justification = "Steam encrypts branch manifest ids with AES-ECB. The format is fixed by Steam.")]
-    [SuppressMessage("Security", "CA5358", Justification = "Same reason: AES-ECB is dictated by Steam.")]
-
     public async Task<DepotManifest> DecryptDepotManifestAsync(
         DepotEncryptedManifest manifest,
         string branchPassword)
@@ -1040,37 +1039,40 @@ public class SteamContentClient : IAsyncDisposable
                     manifest.BranchName);
             }
 
+            return DecryptManifestId(
+                manifest,
+                result.BetaPasswords.Single(x => x.Key == manifest.BranchName).Value);
+        }
+    }
+
+    [SuppressMessage("Security", "S5542", Justification = "Steam encrypts branch manifest ids with AES-ECB. The format is fixed by Steam.")]
+    [SuppressMessage("Security", "CA5358", Justification = "Same reason: AES-ECB is dictated by Steam.")]
+    internal static DepotManifest DecryptManifestId(DepotEncryptedManifest manifest, byte[] key)
+    {
+        try
+        {
+            // Inside the try, so a malformed id is reported the same way as a wrong password
             var encryptedManifestIdBytes = DecodeHexString(manifest.EncryptedManifestId);
 
-            byte[] SymmetricDecryptECB(byte[] input, byte[] key)
-            {
-                using var aes = Aes.Create();
-                aes.BlockSize = 128;
-                aes.KeySize = 256;
-                aes.Mode = CipherMode.ECB;
-                aes.Padding = PaddingMode.PKCS7;
+            using var aes = Aes.Create();
+            aes.BlockSize = 128;
+            aes.KeySize = 256;
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.PKCS7;
 
-                using var aesTransform = aes.CreateDecryptor(key, null);
-                var output = aesTransform.TransformFinalBlock(input, 0, input.Length);
+            using var aesTransform = aes.CreateDecryptor(key, null);
+            var manifestIdBytes = aesTransform.TransformFinalBlock(
+                encryptedManifestIdBytes, 0, encryptedManifestIdBytes.Length);
 
-                return output;
-            }
-            
-            try
-            {
-                var manifestIdBytes = SymmetricDecryptECB(encryptedManifestIdBytes,
-                    result.BetaPasswords.Single(x => x.Key == manifest.BranchName).Value);
-
-                return new DepotManifest(manifest.BranchName, BitConverter.ToUInt64(manifestIdBytes));
-            }
-            catch (Exception ex)
-            {
-                throw new SteamInvalidBranchPasswordException(
-                    manifest.AppId,
-                    manifest.DepotId,
-                    manifest.BranchName,
-                    ex);
-            }
+            return new DepotManifest(manifest.BranchName, BitConverter.ToUInt64(manifestIdBytes));
+        }
+        catch (Exception ex)
+        {
+            throw new SteamInvalidBranchPasswordException(
+                manifest.AppId,
+                manifest.DepotId,
+                manifest.BranchName,
+                ex);
         }
     }
 
@@ -1293,7 +1295,7 @@ public class SteamContentClient : IAsyncDisposable
             .WaitAsync(cancellationToken);
 
         // Steam can split a big answer into several parts, so read all of them
-        foreach (var (key, value) in result.Results!.SelectMany(r => r.Apps))
+        foreach (var (key, value) in RequireResults(result.Results, "app").SelectMany(r => r.Apps))
         {
             _appProductInfos.AddOrUpdate(key, value, (ek, ev) => value);
             productInfos.Add(value);
@@ -1344,7 +1346,7 @@ public class SteamContentClient : IAsyncDisposable
             .ToTask()
             .WaitAsync(cancellationToken);
 
-        foreach (var (key, value) in result.Results!.SelectMany(r => r.Packages))
+        foreach (var (key, value) in RequireResults(result.Results, "package").SelectMany(r => r.Packages))
         {
             _packageProductInfos.AddOrUpdate(key, value, (ek, ev) => value);
             productInfos.Add(value);
@@ -1408,6 +1410,14 @@ public class SteamContentClient : IAsyncDisposable
         var result = await SteamApps.RequestFreeLicense(appId).ToTask().WaitAsync(cancellationToken);
 
         return result.GrantedApps.Contains(appId);
+    }
+
+    // Steam hands back null results when the request fails or times out
+    internal static IEnumerable<T> RequireResults<T>(IEnumerable<T>? results, string description)
+    {
+        return results
+               ?? throw new InvalidOperationException(
+                   $"Steam returned no {description} product information. The request may have failed or timed out.");
     }
 
     private static byte[] DecodeHexString(string hex)
