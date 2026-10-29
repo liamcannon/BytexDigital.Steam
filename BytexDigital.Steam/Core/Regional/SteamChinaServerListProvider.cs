@@ -15,9 +15,6 @@ namespace BytexDigital.Steam.Core.Regional
         private DateTime _lastServerListRefresh = DateTime.MinValue;
         public DateTime LastServerListRefresh => _lastServerListRefresh;
 
-        private DateTime _lastServerListRefresh = DateTime.MinValue;
-        public DateTime LastServerListRefresh => _lastServerListRefresh;
-
         public async Task<IEnumerable<ServerRecord>> FetchServerListAsync()
         {
             var configuration = SteamConfiguration;
