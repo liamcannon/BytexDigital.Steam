@@ -723,6 +723,11 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     {
                         action.Invoke();
                     }
+                    catch (Exception ex)
+                    {
+                        // A handler that throws must not go unnoticed, and must not stop the others
+                        Logger?.LogError(ex, "A download event handler threw an exception.");
+                    }
                     finally
                     {
                         Interlocked.Decrement(ref _eventHandlersRunning);
