@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using BytexDigital.Steam.ContentDelivery.Exceptions;
 using BytexDigital.Steam.Core.Structs;
 using Microsoft.Extensions.Logging;
 using Nito.AsyncEx;
@@ -16,19 +17,21 @@ namespace BytexDigital.Steam.ContentDelivery
     public class SteamCdnServerPool : IDisposable
     {
         private const int MinimumPoolSize = 10;
-        private readonly ConcurrentStack<Server> _activeServerEndpoints;
+        private const int MaxThrottleDelaySeconds = 60;
+        private static readonly TimeSpan PopulateCheckInterval = TimeSpan.FromSeconds(5);
+
+        private readonly ConcurrentStack<Server> _activeServerEndpoints = new();
         private readonly AppId _appId;
-        private readonly BlockingCollection<Server> _availableServerEndpoints;
+        private readonly BlockingCollection<Server> _availableServerEndpoints = new();
         private readonly CancellationTokenSource _cancellationTokenSource;
-        private readonly AsyncManualResetEvent _populatedEvent;
-        private readonly AutoResetEvent _populatePoolEvent;
+        private readonly CancellationToken _token;
+        private readonly AsyncManualResetEvent _populatedEvent = new(false);
+        private readonly AsyncAutoResetEvent _populatePoolEvent = new(true);
+        private readonly SteamContentClient _steamContentClient;
 
-        private readonly Task _populatorTask;
-        private SteamContentClient _steamContentClient;
-
-        public ILogger Logger { get; set; }
+        public ILogger? Logger { get; set; }
         public Client CdnClient { get; }
-        public Server DesignatedProxyServer { get; private set; }
+        public Server? DesignatedProxyServer { get; private set; }
         public bool IsExhausted { get; private set; }
 
         public SteamCdnServerPool(
@@ -38,25 +41,29 @@ namespace BytexDigital.Steam.ContentDelivery
         {
             _steamContentClient = steamContentClient;
             _appId = appId;
-            _cancellationTokenSource =
-                CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, new CancellationTokenSource().Token);
-            _availableServerEndpoints = new BlockingCollection<Server>();
-            _activeServerEndpoints = new ConcurrentStack<Server>();
-            _populatePoolEvent = new AutoResetEvent(true);
-            _populatedEvent = new AsyncManualResetEvent(false);
-            _populatorTask = Task.Factory.StartNew(MonitorAsync).Unwrap();
+            _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _token = _cancellationTokenSource.Token;
 
             CdnClient = new Client(_steamContentClient.SteamClient.InternalClient);
+
+            // MonitorAsync handles its own errors, so it is safe to leave running on its own
+            _ = Task.Run(MonitorAsync);
         }
 
         public void Dispose()
         {
             Close();
+            _cancellationTokenSource.Dispose();
+        }
+
+        public void Close()
+        {
+            _cancellationTokenSource.Cancel();
         }
 
         public Server GetServer(CancellationToken cancellationToken = default)
         {
-            Server server;
+            Server? server;
 
             do
             {
@@ -64,14 +71,21 @@ namespace BytexDigital.Steam.ContentDelivery
                 {
                     if (_availableServerEndpoints.Count < MinimumPoolSize && !_populatedEvent.IsSet)
                     {
-                        Logger?.LogTrace("GetServerAsync: Set populatePoolEvent");
+                        Logger?.LogTrace("GetServer: Set populatePoolEvent");
                         _populatePoolEvent.Set();
-
-                        //Logger?.LogTrace("GetServerAsync: Waiting for pool to be populated");
-                        //await _populatedEvent.WaitAsync(cancellationToken);
                     }
 
-                    server = _availableServerEndpoints.Take(cancellationToken);
+                    // Stops waiting when the caller cancels OR when the pool is closed or gives up
+                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _token);
+
+                    try
+                    {
+                        server = _availableServerEndpoints.Take(linked.Token);
+                    }
+                    catch (OperationCanceledException) when (IsExhausted && !cancellationToken.IsCancellationRequested)
+                    {
+                        throw new SteamNoContentServerFoundException(_appId);
+                    }
                 }
             } while (server == null);
 
@@ -82,80 +96,122 @@ namespace BytexDigital.Steam.ContentDelivery
         {
             if (isFaulty)
             {
+                Logger?.LogDebug("CDN server {Host} ({Type}) dropped from the pool.", server.Host, server.Type);
                 return;
             }
 
             _activeServerEndpoints.Push(server);
         }
 
-        private async Task MonitorAsync()
+        private async Task WaitForPopulateRequestAsync()
         {
-            while (!_cancellationTokenSource.IsCancellationRequested)
+            // Wake up when someone asks for more servers, or after a few seconds to check anyway
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_token);
+            timeout.CancelAfter(PopulateCheckInterval);
+
+            try
             {
-                Logger?.LogTrace("MonitorAsync: Waiting for a few seconds before checking if pool needs population");
-                _populatePoolEvent.WaitOne(TimeSpan.FromSeconds(5));
-
-                Logger?.LogTrace("MonitorAsync: Checking");
-                if (_availableServerEndpoints.Count < MinimumPoolSize)
-                {
-                    Logger?.LogTrace("MonitorAsync: Pool will be populated");
-                    _populatedEvent.Reset();
-
-                    Logger?.LogTrace("MonitorAsync: Getting server list");
-                    var servers = await GetServerListAsync();
-
-                    Logger?.LogTrace("MonitorAsync: Got server list");
-
-                    if (servers.Count == 0)
-                    {
-                        IsExhausted = true;
-                        _populatedEvent.Set();
-                        _cancellationTokenSource.Cancel();
-
-                        return;
-                    }
-
-                    DesignatedProxyServer = servers.FirstOrDefault(x => x.UseAsProxy);
-
-                    var sortedServers = servers
-                        // Filter out servers that aren't relevant to us or our appid
-                        .Where(
-                            server =>
-                            {
-                                var isContentServer = server.Type == "SteamCache" || server.Type == "CDN";
-                                var allowsAppId = server.AllowedAppIds.Length == 0 ||
-                                                  server.AllowedAppIds.Contains(_appId);
-
-                                return isContentServer && allowsAppId;
-                            })
-                        .OrderBy(x => x.WeightedLoad);
-
-                    foreach (var server in sortedServers)
-                    {
-                        _availableServerEndpoints.Add(server);
-                    }
-                }
-
-                Logger?.LogTrace("MonitorAsync: Notifying that pool is populated");
-                _populatedEvent.Set();
+                await _populatePoolEvent.WaitAsync(timeout.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!_token.IsCancellationRequested)
+            {
+                // Only the timer fired, which is expected
             }
         }
 
+        private async Task MonitorAsync()
+        {
+            try
+            {
+                while (!_token.IsCancellationRequested)
+                {
+                    Logger?.LogTrace("MonitorAsync: Waiting before checking if pool needs population");
+                    await WaitForPopulateRequestAsync().ConfigureAwait(false);
+
+                    Logger?.LogTrace("MonitorAsync: Checking");
+                    if (_availableServerEndpoints.Count < MinimumPoolSize)
+                    {
+                        Logger?.LogTrace("MonitorAsync: Pool will be populated");
+                        _populatedEvent.Reset();
+
+                        var servers = await GetServerListAsync().ConfigureAwait(false);
+
+                        if (servers.Count == 0)
+                        {
+                            IsExhausted = true;
+                            _populatedEvent.Set();
+                            _cancellationTokenSource.Cancel();
+
+                            return;
+                        }
+
+                        DesignatedProxyServer = servers.FirstOrDefault(x => x.UseAsProxy);
+
+                        var sortedServers = servers
+                            // Filter out servers that aren't relevant to us or our appid
+                            .Where(
+                                server =>
+                                {
+                                    var isContentServer = server.Type == "SteamCache" || server.Type == "CDN";
+                                    var allowsAppId = server.AllowedAppIds.Length == 0 ||
+                                                      server.AllowedAppIds.Contains(_appId);
+
+                                    return isContentServer && allowsAppId;
+                                })
+                            .OrderBy(x => x.WeightedLoad);
+
+                        var added = 0;
+                        foreach (var server in sortedServers)
+                        {
+                            _availableServerEndpoints.Add(server);
+                            added++;
+                        }
+
+                        Logger?.LogDebug(
+                            "CDN pool for app {AppId} populated: {Added} of {Total} servers usable.",
+                            _appId, added, servers.Count);
+                    }
+
+                    Logger?.LogTrace("MonitorAsync: Notifying that pool is populated");
+                    _populatedEvent.Set();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // The pool was closed
+            }
+            catch (Exception ex)
+            {
+                // If the monitor dies nobody will ever add servers, so make waiting callers give up instead of hanging
+                Logger?.LogError(ex, "CDN server pool monitor stopped unexpectedly");
+                IsExhausted = true;
+                _populatedEvent.Set();
+
+                if (!_token.IsCancellationRequested)
+                {
+                    _cancellationTokenSource.Cancel();
+                }
+            }
+        }
 
         private async Task<IReadOnlyCollection<Server>> GetServerListAsync()
         {
+            const int maxListAttempts = 10;
+            var failures      = 0;
             var throttleDelay = 0;
 
-            while (!_cancellationTokenSource.IsCancellationRequested)
+            while (true)
             {
-                await Task.Delay(TimeSpan.FromSeconds(1), _cancellationTokenSource.Token);
+                _token.ThrowIfCancellationRequested();
+
+                await Task.Delay(TimeSpan.FromSeconds(1), _token).ConfigureAwait(false);
 
                 try
                 {
                     var cdnServers = await ContentServerDirectoryService.LoadAsync(
                         _steamContentClient.SteamClient.InternalClient.Configuration,
                         _steamContentClient.SteamClient.ActiveCellId,
-                        _cancellationTokenSource.Token);
+                        _token).ConfigureAwait(false);
 
                     if (cdnServers == null)
                     {
@@ -165,24 +221,28 @@ namespace BytexDigital.Steam.ContentDelivery
 
                     return cdnServers;
                 }
+                catch (OperationCanceledException) when (_token.IsCancellationRequested)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
+                    Logger?.LogWarning(ex, "Could not load the CDN server list, trying again");
+
+                    if (++failures >= maxListAttempts)
+                    {
+                        // Give up. An empty list marks the pool as exhausted, so callers get an error instead of waiting forever.
+                        return Array.Empty<Server>();
+                    }
+
                     if (ex is SteamKitWebRequestException { StatusCode: HttpStatusCode.TooManyRequests })
                     {
-                        throttleDelay += 5;
+                        throttleDelay = Math.Min(throttleDelay + 5, MaxThrottleDelaySeconds);
 
-                        await Task.Delay(TimeSpan.FromSeconds(throttleDelay), _cancellationTokenSource.Token);
+                        await Task.Delay(TimeSpan.FromSeconds(throttleDelay), _token).ConfigureAwait(false);
                     }
                 }
             }
-
-            return new List<Server>();
-        }
-
-        public void Close()
-        {
-            _cancellationTokenSource.Cancel();
-            _steamContentClient = null;
         }
     }
 }
