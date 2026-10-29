@@ -77,12 +77,12 @@ namespace BytexDigital.Steam.Core
     /// </summary>
     public class ConsoleSteamAuthenticator : SteamAuthenticator
     {
-        private readonly string _persistenceDirectory;
+        private readonly string? _persistenceDirectory;
         private readonly string _uniqueStorageName;
-        public string AccessToken { get; protected set; }
-        public string GuardData { get; protected set; }
+        public string AccessToken { get; protected set; } = string.Empty;
+        public string GuardData { get; protected set; } = string.Empty;
 
-        public ConsoleSteamAuthenticator(string uniqueStorageName, string persistenceDirectory = default)
+        public ConsoleSteamAuthenticator(string uniqueStorageName, string? persistenceDirectory = null)
         {
             _uniqueStorageName = uniqueStorageName;
             _persistenceDirectory = persistenceDirectory;
@@ -103,7 +103,7 @@ namespace BytexDigital.Steam.Core
             {
                 Console.Write("Please enter your 2FA code:");
 
-                code = Console.ReadLine();
+                code = Console.ReadLine() ?? string.Empty;
             } while (string.IsNullOrEmpty(code));
 
             return Task.FromResult(code);
@@ -125,7 +125,7 @@ namespace BytexDigital.Steam.Core
             {
                 Console.Write($"Please enter your 2FA code that was sent to your email ({accountEmail}): ");
 
-                code = Console.ReadLine();
+                code = Console.ReadLine() ?? string.Empty;
             } while (string.IsNullOrEmpty(code));
 
             return Task.FromResult(code);
@@ -140,7 +140,7 @@ namespace BytexDigital.Steam.Core
 
             do
             {
-                response = Console.ReadLine()?.ToLower();
+                response = Console.ReadLine()?.ToLowerInvariant() ?? string.Empty;
             } while (response != "y" && response != "n");
 
             return Task.FromResult(response == "y");
