@@ -24,7 +24,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         }
         
         public string DownloadDirectory { get; protected set; } = null!;
-        public Func<ManifestFile, bool> FileCondition { get; protected set; } =null!;
+        public Func<ManifestFile, bool> FileCondition { get; protected set; } = null!;
         public DownloadHandlerStateEnum State { get; protected set; }
 
         public double TotalProgress
