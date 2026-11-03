@@ -57,9 +57,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void MarkingHealthyInvalidatesAnOutstandingRecoveryProbeLease()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var lease));
 
         Assert.True(tracker.MarkHealthy("a"));
@@ -149,9 +150,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void OnlyOneRecoveryProbeCanBeActiveForAServer()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out _));
         Assert.False(tracker.TryBeginRecoveryProbe("a", out _));
@@ -160,9 +162,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void SuccessfulRecoveryProbeRemovesTheDroppedServer()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var lease));
         Assert.True(tracker.CompleteRecoveryProbe(lease, succeeded: true));
@@ -174,9 +177,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void FailedRecoveryProbeKeepsServerDroppedAndAppliesExponentialBackoff()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var firstLease));
         Assert.True(tracker.CompleteRecoveryProbe(firstLease, succeeded: false));
@@ -201,9 +205,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void RecoveryProbeBackoffNeverExceedsMaximum()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now, maximumProbeDelay: TimeSpan.FromSeconds(20));
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var firstLease));
         Assert.True(tracker.CompleteRecoveryProbe(firstLease, succeeded: false));
@@ -226,9 +231,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void CancellingRecoveryProbeDoesNotRestoreServerOrCountAsFailure()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var lease));
         Assert.True(tracker.CancelRecoveryProbe(lease));
@@ -240,9 +246,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void StaleProbeLeaseCannotCompleteAReplacementProbe()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var staleLease));
         Assert.True(tracker.CancelRecoveryProbe(staleLease));
@@ -258,9 +265,10 @@ public class DroppedServerTrackerTests
     [Fact]
     public void DroppingAnAlreadyDroppedServerDoesNotResetItsBackoff()
     {
-        var now = Start.Add(InitialProbeDelay);
+        var now = Start;
         var tracker = CreateTracker(() => now);
         tracker.Drop("a");
+        now = Start.Add(InitialProbeDelay);
 
         Assert.True(tracker.TryBeginRecoveryProbe("a", out var lease));
         Assert.True(tracker.CompleteRecoveryProbe(lease, succeeded: false));
