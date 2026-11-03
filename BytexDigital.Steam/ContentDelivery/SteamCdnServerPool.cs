@@ -20,7 +20,11 @@ namespace BytexDigital.Steam.ContentDelivery
         private const int MaxThrottleDelaySeconds = 60;
         private static readonly TimeSpan PopulateCheckInterval = TimeSpan.FromSeconds(5);
 
+        // How long a server that failed is kept out of the pool
+        private static readonly TimeSpan DroppedServerCooldown = TimeSpan.FromMinutes(5);
+
         private readonly ConcurrentStack<Server> _activeServerEndpoints = new();
+        private readonly DroppedServerTracker _droppedServers = new(DroppedServerCooldown);
         private readonly AppId _appId;
         private readonly BlockingCollection<Server> _availableServerEndpoints = new();
         private readonly CancellationTokenSource _cancellationTokenSource;
@@ -87,6 +91,12 @@ namespace BytexDigital.Steam.ContentDelivery
                         throw new SteamNoContentServerFoundException(_appId);
                     }
                 }
+
+                // A copy of a server dropped in the meantime can still be queued. Skip it.
+                if (server != null && _droppedServers.IsDropped(ServerKey(server)))
+                {
+                    server = null;
+                }
             } while (server == null);
 
             return server;
@@ -96,12 +106,18 @@ namespace BytexDigital.Steam.ContentDelivery
         {
             if (isFaulty)
             {
-                Logger?.LogDebug("CDN server {Host} ({Type}) dropped from the pool.", server.Host, server.Type);
+                _droppedServers.Drop(ServerKey(server));
+                Logger?.LogDebug(
+                    "CDN server {Host} ({Type}) dropped from the pool for {Minutes} minutes.",
+                    server.Host, server.Type, DroppedServerCooldown.TotalMinutes);
                 return;
             }
 
             _activeServerEndpoints.Push(server);
         }
+
+        // The same host can appear as more than one Server object, so servers are told apart by type and host
+        private static string ServerKey(Server server) => $"{server.Type}:{server.Host}";
 
         private async Task WaitForPopulateRequestAsync()
         {
@@ -147,7 +163,7 @@ namespace BytexDigital.Steam.ContentDelivery
 
                         DesignatedProxyServer = servers.FirstOrDefault(x => x.UseAsProxy);
 
-                        var sortedServers = servers
+                        var candidates = servers
                             // Filter out servers that aren't relevant to us or our appid
                             .Where(
                                 server =>
@@ -158,18 +174,21 @@ namespace BytexDigital.Steam.ContentDelivery
 
                                     return isContentServer && allowsAppId;
                                 })
-                            .OrderBy(x => x.WeightedLoad);
+                            .ToList();
+
+                        // Leave out servers that failed recently. If that would leave none, they are all used again.
+                        var usable = _droppedServers.WithoutDropped(candidates, ServerKey);
 
                         var added = 0;
-                        foreach (var server in sortedServers)
+                        foreach (var server in usable.OrderBy(x => x.WeightedLoad))
                         {
                             _availableServerEndpoints.Add(server);
                             added++;
                         }
 
                         Logger?.LogDebug(
-                            "CDN pool for app {AppId} populated: {Added} of {Total} servers usable.",
-                            _appId, added, servers.Count);
+                            "CDN pool for app {AppId} populated: {Added} of {Total} servers usable, {Dropped} on cooldown.",
+                            _appId, added, servers.Count, candidates.Count - usable.Count);
                     }
 
                     Logger?.LogTrace("MonitorAsync: Notifying that pool is populated");
