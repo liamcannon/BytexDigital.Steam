@@ -23,9 +23,7 @@ namespace BytexDigital.Steam.ContentDelivery
         private static readonly TimeSpan MaximumRecoveryProbeDelay = TimeSpan.FromSeconds(60);
 
         private readonly ConcurrentStack<Server> _activeServerEndpoints = new();
-        private readonly DroppedServerTracker _droppedServers = new(
-            InitialRecoveryProbeDelay,
-            MaximumRecoveryProbeDelay);
+        private readonly DroppedServerTracker _droppedServers;
         private readonly AppId _appId;
         private readonly BlockingCollection<Server> _availableServerEndpoints = new();
         private readonly CancellationTokenSource _cancellationTokenSource;
@@ -57,10 +55,51 @@ namespace BytexDigital.Steam.ContentDelivery
             _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _token = _cancellationTokenSource.Token;
 
+            _droppedServers = new DroppedServerTracker(
+                InitialRecoveryProbeDelay,
+                MaximumRecoveryProbeDelay);
+
             CdnClient = new Client(_steamContentClient.SteamClient.InternalClient);
 
             // MonitorAsync handles its own errors, so it is safe to leave running on its own.
             _ = Task.Run(MonitorAsync);
+        }
+
+        // <summary>
+        //   Creates a pre-populated pool for deterministic server-selection tests.
+        //   Does not start the background monitor or connect to Steam.
+        // </summary>
+        internal SteamCdnServerPool(
+            AppId appId,
+            IEnumerable<Server> initialServers,
+            Func<DateTime> utcNow)
+        {
+            ArgumentNullException.ThrowIfNull(initialServers);
+            ArgumentNullException.ThrowIfNull(utcNow);
+
+            // These are not used because the test pool does not start MonitorAsync
+            // or issue actual CDN requests.
+            _steamContentClient = null!;
+            CdnClient = null!;
+
+            _appId = appId;
+            _cancellationTokenSource = new CancellationTokenSource();
+            _token = _cancellationTokenSource.Token;
+
+            _droppedServers = new DroppedServerTracker(
+                InitialRecoveryProbeDelay,
+                MaximumRecoveryProbeDelay,
+                utcNow);
+
+            _knownServerEndpoints = initialServers.ToArray();
+
+            foreach (var server in _knownServerEndpoints)
+            {
+                _availableServerEndpoints.Add(server);
+            }
+
+            // The supplied snapshot is already populated; there is no monitor to wait for.
+            _populatedEvent.Set();
         }
 
         public void Dispose()
