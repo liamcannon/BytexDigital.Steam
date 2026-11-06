@@ -1,10 +1,13 @@
 ﻿using System;
+using System.Net;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics.CodeAnalysis;
+using Microsoft.Extensions.Logging;
 using BytexDigital.Steam.ContentDelivery.Exceptions;
 using BytexDigital.Steam.ContentDelivery.Models;
 using BytexDigital.Steam.ContentDelivery.Models.Downloading;
@@ -33,9 +36,6 @@ public class SteamContentClient : IAsyncDisposable
     private readonly ConcurrentDictionary<DepotId, byte[]> _depotKeys = new();
 
     // Cache
-    private readonly ConcurrentDictionary<ManifestId, (DateTimeOffset, ulong)> _manifestRequestCodes = new();
-
-    // Cache
     private readonly ConcurrentDictionary<uint, ulong> _packageAccessTokens = new();
 
     // Cache
@@ -50,41 +50,56 @@ public class SteamContentClient : IAsyncDisposable
     public CancellationToken CancellationToken => _cancellationTokenSource.Token;
     public SteamClient SteamClient { get; }
 
+    public ILogger? Logger { get; set; }
+
     internal SteamKit.Internal.PublishedFile PublishedFileService { get; }
     internal SteamKit.SteamUser SteamUser { get; }
     internal SteamKit.SteamApps SteamApps { get; }
     internal SteamKit.SteamUnifiedMessages SteamUnifiedMessagesService { get; }
-    internal ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken> CdnAuthenticationTokens { get; }
     internal int MaxConcurrentDownloadsPerTask { get; }
+
+    // CDN token caching and refresh coordination.
+    private readonly CdnAuthTokenCache _cdnAuthTokenCache = new();
 
     public SteamContentClient(SteamClient steamClient, int maxConcurrentDownloadsPerTask = 10)
     {
         SteamClient = steamClient;
-        SteamUnifiedMessagesService = SteamClient.InternalClient.GetHandler<SteamKit.SteamUnifiedMessages>();
-        PublishedFileService = SteamUnifiedMessagesService.CreateService<PublishedFile>();
-        CdnAuthenticationTokens = new ConcurrentDictionary<string, SteamKit.SteamContent.CDNAuthToken>();
+        var steamUnifiedMessages = SteamClient.InternalClient
+        .GetHandler<SteamKit.SteamUnifiedMessages>()
+        ?? throw new InvalidOperationException(
+            "SteamKit did not provide the SteamUnifiedMessages handler.");
+
+        SteamUnifiedMessagesService = steamUnifiedMessages;
+        PublishedFileService = steamUnifiedMessages.CreateService<PublishedFile>();
+
         MaxConcurrentDownloadsPerTask = maxConcurrentDownloadsPerTask;
-        SteamApps = SteamClient.InternalClient.GetHandler<SteamKit.SteamApps>();
-        SteamUser = SteamClient.InternalClient.GetHandler<SteamKit.SteamUser>();
+
+        SteamApps = SteamClient.InternalClient
+            .GetHandler<SteamKit.SteamApps>()
+            ?? throw new InvalidOperationException(
+                "SteamKit did not provide the SteamApps handler.");
+
+        SteamUser = SteamClient.InternalClient
+            .GetHandler<SteamKit.SteamUser>()
+            ?? throw new InvalidOperationException(
+                "SteamKit did not provide the SteamUser handler.");
 
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(SteamClient.CancellationToken);
     }
 
     public ValueTask DisposeAsync()
     {
-        foreach (var pool in _serverPools)
+        foreach (var pool in _serverPools.Values)
         {
-            try
-            {
-                pool.Value.Dispose();
-            }
-            catch
-            {
-                // ignore
-            }
+            pool.Dispose();
         }
 
-        return default;
+        _serverPools.Clear();
+
+        _cancellationTokenSource.Cancel();
+        _cancellationTokenSource.Dispose();
+
+        return ValueTask.CompletedTask;
     }
 
     public async Task<Manifest> GetManifestAsync(
@@ -93,73 +108,170 @@ public class SteamContentClient : IAsyncDisposable
         ManifestId manifestId,
         CancellationToken cancellationToken = default)
     {
-        await SteamClient.AwaitReadyAsync(cancellationToken);
-
-        var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
-
         if (manifestId == default)
         {
             throw new SteamManifestDownloadException($"Manifest with id = {manifestId} cannot be downloaded.");
         }
 
+        await SteamClient.AwaitReadyAsync(cancellationToken);
+
+        var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
+
         var attempts = 0;
         const int maxAttempts = 5;
 
-        Exception lastException = default;
+        Exception? lastException = null;
+        CdnServerLease? serverLeaseForAuthRetry = null;
+        var recoveryProbeAttempted = false;
 
-        while (attempts < maxAttempts && !cancellationToken.IsCancellationRequested)
+        while (attempts < maxAttempts)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // Keep the same lease checked out while an authentication-token replacement retry is pending.
+            CdnServerLease? serverLease = serverLeaseForAuthRetry;
+            var retryingWithReplacementToken = serverLease.HasValue;
+            var retainServerForRetry = false;
+            serverLeaseForAuthRetry = null;
 
-            Server server = default;
+            var server = serverLease?.Server;
+            var cdnAuthToken = (string?) null;
+            var disposition = CdnServerDisposition.Abandoned;
+            var cdnRequestStarted = false;
+            var cdnRequestSucceeded = false;
 
             try
             {
-                server = pool.GetServer(cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                serverLease ??= pool.GetServerForDownload(
+                    cancellationToken,
+                    allowRecoveryProbe: !recoveryProbeAttempted);
+                server = serverLease.Value.Server;
 
-                var depotKey = await GetDepotKeyAsync(depotId, appId);
+                if (serverLease.Value.RecoveryProbe.HasValue)
+                {
+                    recoveryProbeAttempted = true;
+                }
 
-                //// Get manifest request code from cache or fetch it and put it into the cache
-                //ulong manifestCode;
+                cdnAuthToken = await GetCdnAuthTokenForDownloadAsync(
+                    appId,
+                    depotId,
+                    server,
+                    cancellationToken).ConfigureAwait(false);
 
-                //if (!_manifestRequestCodes.TryGetValue(manifestId., )
+                Logger?.LogDebug(
+                    "Manifest {ManifestId} of depot {DepotId}: attempt {Attempt} of {MaxAttempts} via {Host} ({Type}), auth token: {HasToken}.",
+                    manifestId, depotId, attempts + 1, maxAttempts, server.Host, server.Type, cdnAuthToken != null);
+
+                // Failures obtaining a depot key or manifest request code do not say anything about the CDN host.
+                var depotKey = await GetDepotKeyAsync(depotId, appId)
+                    .WaitAsync(cancellationToken);
 
                 var manifestCode =
                     await SteamClient._steamContentHandler.GetManifestRequestCode(depotId, appId, manifestId)
                         .WaitAsync(cancellationToken);
 
+                cdnRequestStarted = true;
                 var manifest =
-                    await pool.CdnClient.DownloadManifestAsync(depotId, manifestId, manifestCode, server, depotKey)
+                    await pool.CdnClient.DownloadManifestAsync(
+                            depotId, manifestId, manifestCode, server, depotKey, pool.DesignatedProxyServer,
+                            cdnAuthToken: cdnAuthToken)
                         .WaitAsync(cancellationToken);
 
+                // The CDN has successfully served the manifest. Filename decryption is a local operation and
+                // must not cause this endpoint to be marked unhealthy if it fails.
+                cdnRequestSucceeded = true;
+                disposition = CdnServerDisposition.Succeeded;
 
                 if (manifest.FilenamesEncrypted)
                 {
                     manifest.DecryptFilenames(depotKey);
                 }
 
+                Logger?.LogDebug(
+                    "Manifest {ManifestId} of depot {DepotId} downloaded via {Host}.",
+                    manifestId, depotId, server.Host);
                 return manifest;
             }
-            catch (SteamAccessDeniedException)
+            catch (OperationCanceledException)
             {
+                // Cancellation is not evidence that a server is faulty. For a recovery lease, Abandoned
+                // releases the probe without restoring the dropped endpoint.
+                disposition = CdnServerDisposition.Abandoned;
+                throw;
+            }
+            catch (Exception ex) when (ex is SteamAccessDeniedException or SteamNoContentServerFoundException)
+            {
+                // Neither exception establishes whether the endpoint can serve CDN content.
+                disposition = CdnServerDisposition.Abandoned;
                 throw;
             }
             catch (Exception ex)
             {
                 lastException = ex;
+
+                if (cdnRequestStarted && !cdnRequestSucceeded)
+                {
+                    disposition = CdnServerDisposition.Failed;
+                }
+                else if (!cdnRequestStarted)
+                {
+                    disposition = CdnServerDisposition.Abandoned;
+                }
+
+                Logger?.LogWarning(
+                    ex,
+                    "Manifest {ManifestId} of depot {DepotId} failed via {Host} on attempt {Attempt} ({Status}).",
+                    manifestId, depotId, server?.Host, attempts + 1,
+                    (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
+
+                // A CDN gets one authentication-recovery attempt per download sequence. Keep its lease
+                // checked out while retrying with the replacement token.
+                if (server is not null)
+                {
+                    CdnAuthRecoveryAction recoveryAction;
+
+                    try
+                    {
+                        recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
+                            isCdnServer: server.Type == "CDN",
+                            isForbidden: ex is SteamKit.SteamKitWebRequestException
+                                { StatusCode: HttpStatusCode.Forbidden },
+                            retryingWithReplacementToken: retryingWithReplacementToken,
+                            canRetry: attempts + 1 < maxAttempts,
+                            refreshTokenAsync: tokenCancellationToken =>
+                                RefreshCdnAuthTokenAsync(
+                                    appId,
+                                    depotId,
+                                    server,
+                                    cdnAuthToken,
+                                    tokenCancellationToken),
+                            invalidateRejectedTokenAsync: async tokenCancellationToken =>
+                            {
+                                await InvalidateCdnAuthTokenIfMatchesAsync(
+                                    depotId,
+                                    server,
+                                    cdnAuthToken,
+                                    tokenCancellationToken).ConfigureAwait(false);
+                            },
+                            cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        disposition = CdnServerDisposition.Abandoned;
+                        throw;
+                    }
+
+                    if (recoveryAction == CdnAuthRecoveryAction.RetrySameServer)
+                    {
+                        serverLeaseForAuthRetry = serverLease;
+                        retainServerForRetry = true;
+                    }
+                }
             }
             finally
             {
-                if (server != null)
+                if (serverLease.HasValue && !retainServerForRetry)
                 {
-                    try
-                    {
-                        pool.ReturnServer(server, true);
-                    }
-                    catch
-                    {
-                        // Ignore for retry logic
-                    }
+                    pool.ReturnServer(serverLease.Value, disposition);
                 }
 
                 attempts += 1;
@@ -181,21 +293,180 @@ public class SteamContentClient : IAsyncDisposable
 
         if (_serverPools.TryGetValue(appId, out var serverPool))
         {
-            return serverPool;
+            if (!serverPool.IsExhausted)
+            {
+                return serverPool;
+            }
+
+            // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
+            serverPool.Dispose();
         }
 
-        serverPool = new SteamCdnServerPool(this, appId);
-
-        _serverPools.TryAdd(appId, serverPool);
+        serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
+        _serverPools[appId] = serverPool;
 
         return serverPool;
     }
 
+    private static string CdnKey(DepotId depotId, string host) =>
+        $"{depotId.Id}:{host}";
+
+    // The cached token for this depot on this server, or null if the server never asked for one
+    internal string? GetCdnAuthToken(DepotId depotId, Server server)
+    {
+        var host = server.Host;
+
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return null;
+        }
+
+        return _cdnAuthTokenCache.GetToken(CdnKey(depotId, host));
+    }
+
+    internal async Task<string?> GetCdnAuthTokenForDownloadAsync(
+        AppId appId,
+        DepotId depotId,
+        Server server,
+        CancellationToken cancellationToken)
+    {
+        var token = GetCdnAuthToken(depotId, server);
+
+        // Reuse any valid cached token.
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            return token;
+        }
+
+        // Proactively request a token for China-only CDN servers.
+        // This is best-effort because SteamChinaOnly does not
+        // guarantee that the server requires token authentication.
+        if (server.Type != "CDN" || !server.SteamChinaOnly)
+        {
+            return null;
+        }
+
+        var refreshed = await RefreshCdnAuthTokenAsync(
+            appId,
+            depotId,
+            server,
+            rejectedToken: null,
+            cancellationToken).ConfigureAwait(false);
+
+        if (refreshed)
+        {
+            return GetCdnAuthToken(depotId, server);
+        }
+
+        Logger?.LogDebug(
+            "CDN auth for depot {DepotId} via {Host}: no usable token obtained proactively; continuing with normal request and recovery handling.",
+            depotId, server.Host);
+
+        return null;
+    }
+
+    internal Task<bool> InvalidateCdnAuthTokenIfMatchesAsync(
+        DepotId depotId,
+        Server server,
+        string? rejectedToken,
+        CancellationToken cancellationToken)
+    {
+        var host = server.Host;
+
+        if (string.IsNullOrWhiteSpace(host) ||
+            string.IsNullOrWhiteSpace(rejectedToken))
+        {
+            return Task.FromResult(false);
+        }
+
+        return _cdnAuthTokenCache.InvalidateIfTokenMatchesAsync(
+            CdnKey(depotId, host),
+            rejectedToken,
+            cancellationToken);
+    }
+
+    /// <summary>
+    ///     Called after a CDN server answered 403. Returns true if the request is worth retrying on this server
+    ///     (a new token is available), false if the server should be dropped.
+    /// </summary>
+    internal async Task<bool> RefreshCdnAuthTokenAsync(
+        AppId appId,
+        DepotId depotId,
+        Server server,
+        string? rejectedToken,
+        CancellationToken cancellationToken)
+    {
+        var host = server.Host;
+
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            // A CDN authentication token cannot be requested without a host name.
+            return false;
+        }
+
+        // One request at a time, so many workers failing together only ask Steam once.
+        // A valid token that is not the rejected one means another worker already refreshed it.
+        return await _cdnAuthTokenCache.RefreshAsync(
+            CdnKey(depotId, host),
+            rejectedToken,
+            async tokenCancellationToken =>
+            {
+                try
+			    {
+                    var auth = await SteamClient._steamContentHandler
+                        .GetCDNAuthToken(appId, depotId, host)
+                        .WaitAsync(tokenCancellationToken)
+                        .ConfigureAwait(false);
+
+                    var hasToken = !string.IsNullOrWhiteSpace(auth.Token);
+
+                    if (auth.Result != SteamKit.EResult.OK || !hasToken)
+                    {
+                        Logger?.LogWarning(
+                            "CDN auth refresh for depot {DepotId} via {Host} failed: Steam result {Result}; token returned: {HasToken}.",
+                            depotId,
+                            host,
+                            auth.Result,
+                            hasToken);
+
+                        return null;
+                    }
+
+                    Logger?.LogDebug(
+                        "CDN auth refresh for depot {DepotId} via {Host}: Steam result {Result}; token returned: {HasToken}; expiration: {Expiration}.",
+                        depotId,
+                        host,
+                        auth.Result,
+                        hasToken,
+                        auth.Expiration);
+
+                    return new CdnAuthTokenCache.Entry(
+                        auth.Token,
+                        auth.Expiration);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    Logger?.LogWarning(
+                        ex,
+                        "CDN auth refresh request for depot {DepotId} via {Host} threw an exception.",
+                        depotId,
+                        host);
+
+                    throw;
+                }
+            },
+            cancellationToken).ConfigureAwait(false);
+	}
+
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
     {
-        if (_depotKeys.ContainsKey(depotId))
+        if (_depotKeys.TryGetValue(depotId, out var cachedKey))
         {
-            return _depotKeys[depotId];
+            return cachedKey;
         }
 
         var result = await SteamApps.GetDepotDecryptionKey(depotId, appId);
@@ -210,11 +481,8 @@ public class SteamContentClient : IAsyncDisposable
             throw new SteamDepotKeyNotRetrievableException(depotId, result.Result);
         }
 
-        while (!_depotKeys.TryAdd(depotId, result.DepotKey))
-        {
-        }
-
-        return result.DepotKey;
+        // If another thread stored a key while we were waiting on Steam, keep theirs
+        return _depotKeys.GetOrAdd(depotId, result.DepotKey);
     }
 
     public async Task<PublishedFileDetails> GetPublishedFileDetailsAsync(
@@ -262,8 +530,10 @@ public class SteamContentClient : IAsyncDisposable
         var paginationCursor = "*";
         var items = new List<PublishedFileDetails>();
 
-        while (!cancellationToken.IsCancellationRequested)
+        while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var requestDetails = new CPublishedFile_QueryFiles_Request
             {
                 query_type = (uint) SteamKit.EPublishedFileQueryType.RankedByPublicationDate,
@@ -282,6 +552,7 @@ public class SteamContentClient : IAsyncDisposable
                 return_details = true,
                 return_short_description = true
             };
+
 
             var methodResponse = await PublishedFileService.QueryFiles(requestDetails)
                 .ToTask()
@@ -304,7 +575,8 @@ public class SteamContentClient : IAsyncDisposable
     public async Task<IDownloadHandler> GetPublishedFileDataAsync(
         PublishedFileId publishedFileId,
         ManifestId? manifestId = default,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Manifest? knownManifest = null)
     {
         var publishedFileDetails = await GetPublishedFileDetailsAsync(publishedFileId, cancellationToken);
 
@@ -336,9 +608,13 @@ public class SteamContentClient : IAsyncDisposable
             }
         }
 
-        manifestId ??= publishedFileDetails.hcontent_file;
+        // A caller may pass default(ManifestId) to mean "not known". That is a value, not null.
+        if (!manifestId.HasValue || manifestId.Value.Id == 0)
+        {
+            manifestId = publishedFileDetails.hcontent_file;
+        }
 
-        if (!manifestId.HasValue || manifestId.Value == 0)
+        if (!manifestId.HasValue || manifestId.Value.Id == 0)
         {
             throw new SteamAccessDeniedException(
                 "Cannot download workshop item because no manifest id was found (Maybe you don't have access to this workshop).");
@@ -349,15 +625,16 @@ public class SteamContentClient : IAsyncDisposable
             publishedFileDetails.consumer_appid,
             manifestId.Value,
             true,
-            cancellationToken);
+            cancellationToken,
+            knownManifest);
     }
 
     public async Task<IDownloadHandler> GetAppDataAsync(
         AppId appId,
         string branch = "public",
-        string branchPassword = default,
+        string? branchPassword = null,
         bool skipInaccessibleDepots = true,
-        Func<Depot, bool> depotIdCondition = default,
+        Func<Depot, bool>? depotIdCondition = null,
         CancellationToken cancellationToken = default)
     {
         // Get all depots that are part of the branch
@@ -367,7 +644,7 @@ public class SteamContentClient : IAsyncDisposable
         depotIdCondition ??= x => true;
         depots = depots.Where(x => depotIdCondition.Invoke(x)).ToList();
 
-        if (depots == null)
+        if (depots.Count == 0)
         {
             throw new SteamDownloadCriteriaHaveNoResultException(
                 "No depot to download found that matches the criteria.");
@@ -400,7 +677,7 @@ public class SteamContentClient : IAsyncDisposable
                 {
                     if (branchPassword == null)
                     {
-                        throw new SteamInvalidBranchPasswordException(appId, depot.Id, branch, branchPassword);
+                        throw new SteamInvalidBranchPasswordException(appId, depot.Id, branch);
                     }
 
 
@@ -435,7 +712,7 @@ public class SteamContentClient : IAsyncDisposable
         AppId appId,
         DepotId depotId,
         string branch = "public",
-        string branchPassword = default,
+        string? branchPassword = null,
         bool skipInaccessibleDepots = true,
         CancellationToken cancellationToken = default)
     {
@@ -462,9 +739,17 @@ public class SteamContentClient : IAsyncDisposable
             cancellationToken);
     }
 
+    private static SteamKit.KeyValue GetDepotsSection(
+        SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo appInfo,
+        AppId appId)
+    {
+        return appInfo.KeyValues.Children.FirstOrDefault(x => x.Name == "depots")
+               ?? throw new SteamDepotNotFoundException($"App {appId} has no depot information.");
+    }
+
     public async Task<IReadOnlyList<Depot>> GetDepotsAsync(
         AppId appId,
-        string branch = default,
+        string? branch = null,
         bool resolveSharedDepots = true,
         CancellationToken cancellationToken = default)
     {
@@ -472,14 +757,14 @@ public class SteamContentClient : IAsyncDisposable
         {
             // Check if the branch exists.
             if ((await GetBranchesAsync(appId, cancellationToken)).All(
-                    b => b.Name.ToLowerInvariant() != branch.ToLowerInvariant()))
+                    b => !string.Equals(b.Name, branch, StringComparison.OrdinalIgnoreCase)))
             {
                 throw new SteamBranchNotFoundException(appId, branch);
             }
         }
 
         var appInfo = await GetAppInfoAsync(appId, cancellationToken);
-        var allDepotData = appInfo.KeyValues.Children.First(x => x.Name == "depots");
+        var allDepotData = GetDepotsSection(appInfo, appId);
         var filteredDepotData = new List<SteamKit.KeyValue>();
         var parsedDepots = new List<Depot>();
 
@@ -502,10 +787,10 @@ public class SteamContentClient : IAsyncDisposable
 
             // If this is a shared install, fetch the depot data separately, because this "link" to the actual depot
             // will not contain any manifests!
-            if (isSharedInstall && resolveSharedDepots)
+            if (isSharedInstall && resolveSharedDepots && depotFromApp.HasValue)
             {
                 var sharedAppInfo = await GetAppInfoAsync(depotFromApp!.Value, cancellationToken);
-                var sharedAppInfoDepots = sharedAppInfo.KeyValues.Children.First(x => x.Name == "depots");
+                var sharedAppInfoDepots = GetDepotsSection(sharedAppInfo, depotFromApp.Value);
 
                 foreach (var sharedAppInfoDepot in sharedAppInfoDepots.Children)
                 {
@@ -527,7 +812,8 @@ public class SteamContentClient : IAsyncDisposable
             var depotId = uint.Parse(depot.Name!);
 
             // Collect data
-            var name = depot["name"].Value;
+            // The name is only informational, and some depots in Steam's data have none
+            var name = depot["name"].Value ?? $"Depot {depotId}";
             var maxSize = depot["maxsize"].AsUnsignedLong();
             var isSharedInstall = depot["sharedinstall"].AsBoolean();
             var depotFromApp = (AppId?) depot["depotfromapp"].AsUnsignedInteger();
@@ -537,71 +823,110 @@ public class SteamContentClient : IAsyncDisposable
             var languages = new List<string>();
             var configEntries = new Dictionary<string, string>();
 
-            foreach (var configEntry in depot["config"].Children)
+        foreach (var configEntry in depot["config"].Children)
+        {
+            var entryName = configEntry.Name;
+
+            if (string.IsNullOrEmpty(entryName))
             {
-                if (configEntry.Name == "oslist")
+                continue;
+            }
+
+            if (entryName == "oslist")
+            {
+                var value = configEntry.AsString();
+
+                if (!string.IsNullOrEmpty(value))
                 {
                     operatingSystems.AddRange(
-                        configEntry
-                            .AsString()
-                            .Split(',')
+                        value.Split(',', StringSplitOptions.RemoveEmptyEntries)
                             .Select(identifier => new SteamOs(identifier)));
                 }
-                else if (configEntry.Name == "osarch")
+            }
+            else if (entryName == "osarch")
+            {
+                var value = configEntry.AsString();
+
+                if (!string.IsNullOrEmpty(value))
                 {
                     processorArchitectures.AddRange(
-                        configEntry
-                            .AsString()
-                            .Split(','));
-                }
-                else if (configEntry.Name == "language")
-                {
-                    languages.AddRange(
-                        configEntry
-                            .AsString()
-                            .Split(','));
-                }
-                else
-                {
-                    configEntries.Add(configEntry.Name, configEntry.Value);
+                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
                 }
             }
+            else if (entryName == "language")
+            {
+                var value = configEntry.AsString();
+
+                if (!string.IsNullOrEmpty(value))
+                {
+                    languages.AddRange(
+                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
+                }
+            }
+            else
+            {
+                var value = configEntry.Value;
+
+                if (value is not null)
+                {
+                    configEntries[entryName] = value;
+                }
+            }
+        }
 
             var manifests = depot["manifests"]
                 .Children
-                .Select(x => new DepotManifest(x.Name, x["gid"].AsUnsignedLong()))
+                .Select(x => new DepotManifest(
+                    x.Name ?? throw new InvalidOperationException(
+                        "A depot manifest entry is missing its branch name."),
+                    x["gid"].AsUnsignedLong()))
                 .ToList();
 
             var encryptedManifests = depot["encryptedmanifests"]
                 .Children
-                .Select(
-                    manifest =>
+                .Select(manifest =>
                     {
+                        var branchName = manifest.Name
+                            ?? throw new InvalidOperationException(
+                                "An encrypted depot manifest is missing its branch name.");
+
                         if (manifest["encrypted_gid_2"] != SteamKit.KeyValue.Invalid)
                         {
+                            var encryptedGid = manifest["encrypted_gid_2"].Value
+                                ?? throw new InvalidOperationException(
+                                    "An encrypted depot manifest is missing its V2 ID.");
+
                             return new DepotEncryptedManifest(
                                 appId,
                                 depotId,
-                                manifest.Name,
-                                manifest["encrypted_gid_2"].Value,
+                                branchName,
+                                encryptedGid,
                                 DepotEncryptedManifest.EncryptionVersion.V2);
                         }
 
                         if (manifest["encrypted_gid"] != SteamKit.KeyValue.Invalid)
                         {
+                            var encryptedGid = manifest["encrypted_gid"].Value
+                                ?? throw new InvalidOperationException(
+                                    "An encrypted depot manifest is missing its V1 ID.");
+
                             return new DepotEncryptedManifest(
                                 appId,
                                 depotId,
-                                manifest.Name,
-                                manifest["encrypted_gid"].Value,
+                                branchName,
+                                encryptedGid,
                                 DepotEncryptedManifest.EncryptionVersion.V1);
                         }
+
+                        var gid = manifest["gid"].Value
+                            ?? throw new InvalidOperationException(
+                                "An encrypted depot manifest is missing its fallback ID.");
 
                         return new DepotEncryptedManifest(
                             appId,
                             depotId,
-                            manifest.Name,
-                            manifest["gid"].Value,
+                            branchName,
+                            gid,
                             DepotEncryptedManifest.EncryptionVersion.V2);
                     })
                 .ToList();
@@ -611,11 +936,11 @@ public class SteamContentClient : IAsyncDisposable
             if (branch != default)
             {
                 manifests = manifests
-                    .Where(x => x.BranchName.ToLowerInvariant() == branch.ToLowerInvariant())
+                    .Where(x => string.Equals(x.BranchName, branch, StringComparison.OrdinalIgnoreCase))
                     .ToList();
 
                 encryptedManifests = encryptedManifests
-                    .Where(x => x.BranchName.ToLowerInvariant() == branch.ToLowerInvariant())
+                    .Where(x => string.Equals(x.BranchName, branch, StringComparison.OrdinalIgnoreCase))
                     .ToList();
             }
 
@@ -670,7 +995,7 @@ public class SteamContentClient : IAsyncDisposable
         await ValidateBranchPasswordAsync(
             depots.SelectMany(
                 x => x.EncryptedManifests.Where(
-                    m => m.BranchName.ToLowerInvariant() == branch.ToLowerInvariant())),
+                    m => string.Equals(m.BranchName, branch, StringComparison.OrdinalIgnoreCase))),
             branchPassword);
     }
 
@@ -694,16 +1019,22 @@ public class SteamContentClient : IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var appInfo = await GetAppInfoAsync(appId, cancellationToken);
-        var depots = appInfo.KeyValues.Children.First(x => x.Name == "depots");
+        var depots = GetDepotsSection(appInfo, appId);
         var branches = depots["branches"];
 
         var parsedBranches = new List<Branch>();
 
         foreach (var branch in branches.Children)
         {
-            var name = branch.Name;
+            var name = branch.Name
+                ?? throw new InvalidOperationException(
+                    "A branch is missing its name.");
+
             var buildid = branch["buildid"].AsUnsignedLong();
-            var description = branch["description"].AsString();
+
+            var description = branch["description"].AsString()
+                ?? string.Empty;
+
             var requiresPassword = branch["pwdrequired"].AsBoolean();
             var timeUpdated = branch["timeupdated"].AsLong();
 
@@ -725,22 +1056,7 @@ public class SteamContentClient : IAsyncDisposable
     {
         if (manifest.Version == DepotEncryptedManifest.EncryptionVersion.V1)
         {
-            //  var manifestCryptoInput = DecodeHexString(manifest.EncryptedManifestId);
-            //  var manifestIdBytes =
-            //      SteamKit.CryptoHelper.VerifyAndDecryptPassword(manifestCryptoInput, branchPassword);
-            //
-            //  if (manifestIdBytes == null)
-            //  {
-            //      throw new SteamInvalidBranchPasswordException(
-            //          manifest.AppId,
-            //          manifest.DepotId,
-            //          manifest.BranchName,
-            //          branchPassword);
-            //  }
-            //
-            // return new DepotManifest(manifest.BranchName, BitConverter.ToUInt64(manifestIdBytes));
-
-            throw new NotImplementedException();
+            throw new NotSupportedException("Version 1 encrypted manifests are not supported.");
         }
         else
         {
@@ -751,52 +1067,51 @@ public class SteamContentClient : IAsyncDisposable
                 throw new SteamInvalidBranchPasswordException(
                     manifest.AppId,
                     manifest.DepotId,
-                    manifest.BranchName,
-                    branchPassword);
+                    manifest.BranchName);
             }
 
+            return DecryptManifestId(
+                manifest,
+                result.BetaPasswords.Single(x => x.Key == manifest.BranchName).Value);
+        }
+    }
+
+    [SuppressMessage("Security", "S5542", Justification = "Steam encrypts branch manifest ids with AES-ECB. The format is fixed by Steam.")]
+    [SuppressMessage("Security", "CA5358", Justification = "Same reason: AES-ECB is dictated by Steam.")]
+    internal static DepotManifest DecryptManifestId(DepotEncryptedManifest manifest, byte[] key)
+    {
+        try
+        {
+            // Inside the try, so a malformed id is reported the same way as a wrong password
             var encryptedManifestIdBytes = DecodeHexString(manifest.EncryptedManifestId);
 
-            byte[] SymmetricDecryptECB(byte[] input, byte[] key)
-            {
-                using var aes = Aes.Create();
-                aes.BlockSize = 128;
-                aes.KeySize = 256;
-                aes.Mode = CipherMode.ECB;
-                aes.Padding = PaddingMode.PKCS7;
+            using var aes = Aes.Create();
+            aes.BlockSize = 128;
+            aes.KeySize = 256;
+            aes.Mode = CipherMode.ECB;
+            aes.Padding = PaddingMode.PKCS7;
 
-                using var aesTransform = aes.CreateDecryptor(key, null);
-                var output = aesTransform.TransformFinalBlock(input, 0, input.Length);
+            using var aesTransform = aes.CreateDecryptor(key, null);
+            var manifestIdBytes = aesTransform.TransformFinalBlock(
+                encryptedManifestIdBytes, 0, encryptedManifestIdBytes.Length);
 
-                return output;
-            }
-            
-            try
-            {
-                var manifestIdBytes = SymmetricDecryptECB(encryptedManifestIdBytes,
-                    result.BetaPasswords.Single(x => x.Key == manifest.BranchName).Value);
-
-                return new DepotManifest(manifest.BranchName, BitConverter.ToUInt64(manifestIdBytes));
-            }
-            catch (Exception ex)
-            {
-                throw new SteamInvalidBranchPasswordException(
-                    manifest.AppId,
-                    manifest.DepotId,
-                    manifest.BranchName,
-                    branchPassword,
-                    ex);
-            }
+            return new DepotManifest(manifest.BranchName, BitConverter.ToUInt64(manifestIdBytes));
         }
-
-        throw new NotImplementedException();
+        catch (Exception ex)
+        {
+            throw new SteamInvalidBranchPasswordException(
+                manifest.AppId,
+                manifest.DepotId,
+                manifest.BranchName,
+                ex);
+        }
     }
 
     public async Task<ManifestId> GetDepotManifestIdAsync(
         AppId appId,
         DepotId depotId,
         string branch = "public",
-        string branchPassword = default,
+        string? branchPassword = null,
         CancellationToken cancellationToken = default)
     {
         // Enforce a default branch.
@@ -835,7 +1150,7 @@ public class SteamContentClient : IAsyncDisposable
         {
             if (branchPassword == null)
             {
-                throw new SteamInvalidBranchPasswordException(appId, depotId, branch, branchPassword);
+                throw new SteamInvalidBranchPasswordException(appId, depotId, branch);
             }
 
             manifest = await DecryptDepotManifestAsync(encryptedManifest, branchPassword);
@@ -852,7 +1167,8 @@ public class SteamContentClient : IAsyncDisposable
         DepotId depotId,
         ManifestId manifestId,
         bool isUserGeneratedContent = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Manifest? knownManifest = null)
     {
         if (!await GetHasAccessAsync(appId, cancellationToken))
         {
@@ -867,19 +1183,16 @@ public class SteamContentClient : IAsyncDisposable
         if (isUserGeneratedContent)
         {
             var appInfo = await GetAppInfoAsync(appId, cancellationToken);
-            var depotsRaw = appInfo.KeyValues.Children.First(x => x.Name == "depots");
+            var depotsRaw = GetDepotsSection(appInfo, appId);
 
             depotId = depotsRaw["workshopdepot"].AsUnsignedInteger();
 
-            return new DefaultDownloadHandler(
-                this,
-                await GetManifestAsync(
-                    appId,
-                    depotId,
-                    manifestId,
-                    cancellationToken),
-                appId,
-                depotId);
+            // Reuse the caller's manifest only when it is the exact one this download needs
+            var manifest = IsManifestFor(knownManifest, depotId, manifestId)
+                ? knownManifest
+                : await GetManifestAsync(appId, depotId, manifestId, cancellationToken);
+
+            return new DefaultDownloadHandler(this, manifest, appId, depotId);
         }
 
         var depots = await GetDepotsAsync(appId, cancellationToken: cancellationToken);
@@ -968,7 +1281,7 @@ public class SteamContentClient : IAsyncDisposable
     {
         var result = await GetAppProductInfoAsync(new List<AppId> { appId }, false, cancellationToken);
 
-        return result.First(x => x.ID == appId);
+        return result.First(x => x.ID == appId.Id);
     }
 
     internal async Task<List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>> GetAppProductInfoAsync(
@@ -1000,11 +1313,18 @@ public class SteamContentClient : IAsyncDisposable
                 });
         }
 
+        // Everything was in the cache, so there is nothing to ask Steam
+        if (appRequests.Count == 0)
+        {
+            return productInfos;
+        }
+
         var result = await SteamApps.PICSGetProductInfo(appRequests, new List<SteamKit.SteamApps.PICSRequest>())
             .ToTask()
             .WaitAsync(cancellationToken);
 
-        foreach (var (key, value) in result.Results!.First().Apps)
+        // Steam can split a big answer into several parts, so read all of them
+        foreach (var (key, value) in RequireResults(result.Results, "app").SelectMany(r => r.Apps))
         {
             _appProductInfos.AddOrUpdate(key, value, (ek, ev) => value);
             productInfos.Add(value);
@@ -1020,35 +1340,42 @@ public class SteamContentClient : IAsyncDisposable
             CancellationToken cancellationToken = default)
     {
         var productInfos = new List<SteamKit.SteamApps.PICSProductInfoCallback.PICSProductInfo>();
-        var packageRequests = new List<SteamKit.SteamApps.PICSRequest>();
+        var missing = new List<uint>();
 
         foreach (var packageId in packageIds)
         {
-            // Retrieve from cache if possible
+            // Retrieve from cache if possible, only ask Steam about the rest
             if (!forceUpdate && _packageProductInfos.TryGetValue(packageId, out var info))
             {
                 productInfos.Add(info);
             }
+            else
+            {
+                missing.Add(packageId);
+            }
         }
 
-        // Fetch live
-        var grantedIds = await RequestPackageAccessTokenIfNecessaryAsync(packageIds, cancellationToken);
-
-        foreach (var grantedPackageId in grantedIds)
+        if (missing.Count == 0)
         {
-            packageRequests.Add(
-                new SteamKit.SteamApps.PICSRequest
-                {
-                    ID = grantedPackageId,
-                    AccessToken = _packageAccessTokens[grantedPackageId]
-                });
+            return productInfos;
+        }
+
+        var grantedIds = await RequestPackageAccessTokenIfNecessaryAsync(missing, cancellationToken);
+
+        var packageRequests = grantedIds
+            .Select(id => new SteamKit.SteamApps.PICSRequest { ID = id, AccessToken = _packageAccessTokens[id] })
+            .ToList();
+
+        if (packageRequests.Count == 0)
+        {
+            return productInfos;
         }
 
         var result = await SteamApps.PICSGetProductInfo(new List<SteamKit.SteamApps.PICSRequest>(), packageRequests)
             .ToTask()
             .WaitAsync(cancellationToken);
 
-        foreach (var (key, value) in result.Results!.First().Packages)
+        foreach (var (key, value) in RequireResults(result.Results, "package").SelectMany(r => r.Packages))
         {
             _packageProductInfos.AddOrUpdate(key, value, (ek, ev) => value);
             productInfos.Add(value);
@@ -1067,22 +1394,17 @@ public class SteamContentClient : IAsyncDisposable
         uint id,
         CancellationToken cancellationToken = default)
     {
-        List<uint> packageIds = null;
+        // 17906 is the package id for downloading anonymous dedicated servers.
+        // One package id grants access to many app ids.
+        const uint dedicatedServerPackageId = 17906;
 
-        if (SteamUser.SteamID!.AccountType == SteamKit.EAccountType.AnonUser)
-        {
-            // 17906 is the package id for downloading anonymous dedicated servers.
-            // One package id grants access to many app ids.
-            packageIds = new List<uint> { 17906 };
-        }
-        else
-        {
-            packageIds = SteamClient.Licenses.Select(x => x.PackageID).ToList();
+        var packageIds = SteamUser.SteamID!.AccountType == SteamKit.EAccountType.AnonUser
+            ? new List<uint>()
+            : SteamClient.Licenses.Select(x => x.PackageID).ToList();
 
-            if (!packageIds.Contains(17906))
-            {
-                packageIds.Add(17906);
-            }
+        if (!packageIds.Contains(dedicatedServerPackageId))
+        {
+            packageIds.Add(dedicatedServerPackageId);
         }
 
         var packageInfos = await GetPackageProductInfoAsync(packageIds, false, cancellationToken);
@@ -1119,12 +1441,28 @@ public class SteamContentClient : IAsyncDisposable
         return result.GrantedApps.Contains(appId);
     }
 
+    // True when a manifest the caller already holds is the one this download needs
+    internal static bool IsManifestFor(
+        [NotNullWhen(true)] Manifest? manifest,
+        DepotId depotId,
+        ManifestId manifestId)
+    {
+        return manifest != null
+               && manifest.DepotId == depotId
+               && manifest.ManifestId == manifestId;
+    }
+
+    // Steam hands back null results when the request fails or times out
+    internal static IEnumerable<T> RequireResults<T>(IEnumerable<T>? results, string description)
+    {
+        return results
+               ?? throw new InvalidOperationException(
+                   $"Steam returned no {description} product information. The request may have failed or timed out.");
+    }
+
     private static byte[] DecodeHexString(string hex)
     {
-        if (hex == null)
-        {
-            return null;
-        }
+        ArgumentNullException.ThrowIfNull(hex);
 
         var chars = hex.Length;
         var bytes = new byte[chars / 2];

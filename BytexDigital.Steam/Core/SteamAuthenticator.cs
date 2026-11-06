@@ -40,11 +40,17 @@ namespace BytexDigital.Steam.Core
 
         /// <summary>
         ///     Called to persist the successfully received JWT access token.
+        ///     Passing an empty token clears the previously persisted access token.
         /// </summary>
         /// <param name="token">JWT access token.</param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
         public abstract Task PersistAccessTokenAsync(string token, CancellationToken cancellationToken = default);
+
+        internal Task ClearAccessTokenAsync(CancellationToken cancellationToken = default)
+        {
+            return PersistAccessTokenAsync(string.Empty, cancellationToken);
+        }
 
         /// <summary>
         ///     Called to retrieve the JWT access token for sign in.
@@ -77,12 +83,12 @@ namespace BytexDigital.Steam.Core
     /// </summary>
     public class ConsoleSteamAuthenticator : SteamAuthenticator
     {
-        private readonly string _persistenceDirectory;
+        private readonly string? _persistenceDirectory;
         private readonly string _uniqueStorageName;
-        public string AccessToken { get; protected set; }
-        public string GuardData { get; protected set; }
+        public string AccessToken { get; protected set; } = string.Empty;
+        public string GuardData { get; protected set; } = string.Empty;
 
-        public ConsoleSteamAuthenticator(string uniqueStorageName, string persistenceDirectory = default)
+        public ConsoleSteamAuthenticator(string uniqueStorageName, string? persistenceDirectory = null)
         {
             _uniqueStorageName = uniqueStorageName;
             _persistenceDirectory = persistenceDirectory;
@@ -103,7 +109,7 @@ namespace BytexDigital.Steam.Core
             {
                 Console.Write("Please enter your 2FA code:");
 
-                code = Console.ReadLine();
+                code = Console.ReadLine() ?? string.Empty;
             } while (string.IsNullOrEmpty(code));
 
             return Task.FromResult(code);
@@ -125,7 +131,7 @@ namespace BytexDigital.Steam.Core
             {
                 Console.Write($"Please enter your 2FA code that was sent to your email ({accountEmail}): ");
 
-                code = Console.ReadLine();
+                code = Console.ReadLine() ?? string.Empty;
             } while (string.IsNullOrEmpty(code));
 
             return Task.FromResult(code);
@@ -140,7 +146,7 @@ namespace BytexDigital.Steam.Core
 
             do
             {
-                response = Console.ReadLine()?.ToLower();
+                response = Console.ReadLine()?.ToLowerInvariant() ?? string.Empty;
             } while (response != "y" && response != "n");
 
             return Task.FromResult(response == "y");
@@ -148,12 +154,34 @@ namespace BytexDigital.Steam.Core
 
         public override Task PersistAccessTokenAsync(string token, CancellationToken cancellationToken = default)
         {
+            if (string.IsNullOrEmpty(token))
+            {
+                return ClearAccessTokenCoreAsync(cancellationToken);
+            }
+
             AccessToken = token;
 
             if (string.IsNullOrEmpty(_persistenceDirectory)) return Task.CompletedTask;
 
             Directory.CreateDirectory(_persistenceDirectory);
             File.WriteAllText(Path.Combine(_persistenceDirectory, $"{_uniqueStorageName}_accesstoken"), AccessToken);
+
+            return Task.CompletedTask;
+        }
+
+        private Task ClearAccessTokenCoreAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Clear the in-memory access token.
+            AccessToken = string.Empty;
+
+            if (string.IsNullOrEmpty(_persistenceDirectory)) return Task.CompletedTask;
+
+            var path = Path.Combine(_persistenceDirectory, $"{_uniqueStorageName}_accesstoken");
+
+            // Delete the persisted access token.
+            File.Delete(path);
 
             return Task.CompletedTask;
         }
