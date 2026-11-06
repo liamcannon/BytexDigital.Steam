@@ -40,11 +40,17 @@ namespace BytexDigital.Steam.Core
 
         /// <summary>
         ///     Called to persist the successfully received JWT access token.
+        ///     Passing an empty token clears the previously persisted access token.
         /// </summary>
         /// <param name="token">JWT access token.</param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
         public abstract Task PersistAccessTokenAsync(string token, CancellationToken cancellationToken = default);
+
+        internal Task ClearAccessTokenAsync(CancellationToken cancellationToken = default)
+        {
+            return PersistAccessTokenAsync(string.Empty, cancellationToken);
+        }
 
         /// <summary>
         ///     Called to retrieve the JWT access token for sign in.
@@ -148,12 +154,34 @@ namespace BytexDigital.Steam.Core
 
         public override Task PersistAccessTokenAsync(string token, CancellationToken cancellationToken = default)
         {
+            if (string.IsNullOrEmpty(token))
+            {
+                return ClearAccessTokenCoreAsync(cancellationToken);
+            }
+
             AccessToken = token;
 
             if (string.IsNullOrEmpty(_persistenceDirectory)) return Task.CompletedTask;
 
             Directory.CreateDirectory(_persistenceDirectory);
             File.WriteAllText(Path.Combine(_persistenceDirectory, $"{_uniqueStorageName}_accesstoken"), AccessToken);
+
+            return Task.CompletedTask;
+        }
+
+        private Task ClearAccessTokenCoreAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Clear the in-memory access token.
+            AccessToken = string.Empty;
+
+            if (string.IsNullOrEmpty(_persistenceDirectory)) return Task.CompletedTask;
+
+            var path = Path.Combine(_persistenceDirectory, $"{_uniqueStorageName}_accesstoken");
+
+            // Delete the persisted access token.
+            File.Delete(path);
 
             return Task.CompletedTask;
         }

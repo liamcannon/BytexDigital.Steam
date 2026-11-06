@@ -35,6 +35,9 @@ namespace BytexDigital.Steam.Core
         private readonly AsyncManualResetEvent _licensesReceived = new(false);
         private int _logonAttemptsCounter;
         private int _cmAttemptsCounter;
+        // Tracks whether the pending Steam logon was submitted using an access token.
+        // Used to ensure only rejected access tokens trigger credential cleanup.
+        private volatile bool _logonUsedAccessToken;
 
         /// <summary>
         ///     Credentials that this instance will use to log in after connecting.
@@ -313,6 +316,8 @@ namespace BytexDigital.Steam.Core
                             return;
                         }
 
+                        _logonUsedAccessToken = !string.IsNullOrEmpty(accessToken);
+
                         _steamUserHandler.LogOn(
                             new SteamKit.SteamUser.LogOnDetails
                             {
@@ -324,6 +329,7 @@ namespace BytexDigital.Steam.Core
             }
             else
             {
+                _logonUsedAccessToken = false;
                 _steamUserHandler.LogOnAnonymous();
             }
         }
@@ -421,6 +427,11 @@ namespace BytexDigital.Steam.Core
             // Locking this semaphore makes the reconnect logic halt until we are done in this method
             using var lk = await _clientReconnectSemaphore.LockAsync();
 
+            // Capture and reset the credential state for this login response.
+            // This prevents the previous login attempt from affecting subsequent callbacks.
+            var logonUsedAccessToken = _logonUsedAccessToken;
+            _logonUsedAccessToken = false;
+
             if (callback.Result == SteamKit.EResult.OK)
             {
                 // Set the cell ID our Steam Client actually connected to
@@ -460,14 +471,34 @@ namespace BytexDigital.Steam.Core
                 return;
             }
 
+            if (ShouldClearAccessToken(logonUsedAccessToken, callback.Result))
+            {
+                await _steamAuthenticator.ClearAccessTokenAsync(_token);
+            }
+
             // Don't spam unsuccessful logon attempts as this might get us rate limited
             SetFaultedAndShutdown(new SteamAuthenticationException(callback.Result));
+        }
+
+        // Only explicitly rejected access-token results should trigger cleanup.
+        // Other authentication failures must preserve the existing credentials.
+        internal static bool ShouldClearAccessToken(
+            bool logonUsedAccessToken,
+            SteamKit.EResult result)
+        {
+            if (!logonUsedAccessToken) return false;
+
+            return result is
+                SteamKit.EResult.InvalidSignature or
+                SteamKit.EResult.AccessDenied or
+                SteamKit.EResult.Expired or
+                SteamKit.EResult.Revoked;
         }
 
         private void SetFaultedAndShutdown(Exception exception)
         {
             FaultException = exception;
-            
+
             Shutdown();
         }
 

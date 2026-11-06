@@ -115,6 +115,10 @@ public class SteamContentClient : IAsyncDisposable
 
         await SteamClient.AwaitReadyAsync(cancellationToken);
 
+        // The key does not depend on which CDN server answers, so get it once, up front. A failure here
+        // then stops the download straight away, instead of costing attempts and dropped servers.
+        var depotKey = await GetDepotKeyAsync(depotId, appId).WaitAsync(cancellationToken);
+
         var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
 
         var attempts = 0;
@@ -574,7 +578,8 @@ public class SteamContentClient : IAsyncDisposable
     public async Task<IDownloadHandler> GetPublishedFileDataAsync(
         PublishedFileId publishedFileId,
         ManifestId? manifestId = default,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Manifest? knownManifest = null)
     {
         var publishedFileDetails = await GetPublishedFileDetailsAsync(publishedFileId, cancellationToken);
 
@@ -623,7 +628,8 @@ public class SteamContentClient : IAsyncDisposable
             publishedFileDetails.consumer_appid,
             manifestId.Value,
             true,
-            cancellationToken);
+            cancellationToken,
+            knownManifest);
     }
 
     public async Task<IDownloadHandler> GetAppDataAsync(
@@ -1164,7 +1170,8 @@ public class SteamContentClient : IAsyncDisposable
         DepotId depotId,
         ManifestId manifestId,
         bool isUserGeneratedContent = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        Manifest? knownManifest = null)
     {
         if (!await GetHasAccessAsync(appId, cancellationToken))
         {
@@ -1183,15 +1190,12 @@ public class SteamContentClient : IAsyncDisposable
 
             depotId = depotsRaw["workshopdepot"].AsUnsignedInteger();
 
-            return new DefaultDownloadHandler(
-                this,
-                await GetManifestAsync(
-                    appId,
-                    depotId,
-                    manifestId,
-                    cancellationToken),
-                appId,
-                depotId);
+            // Reuse the caller's manifest only when it is the exact one this download needs
+            var manifest = IsManifestFor(knownManifest, depotId, manifestId)
+                ? knownManifest
+                : await GetManifestAsync(appId, depotId, manifestId, cancellationToken);
+
+            return new DefaultDownloadHandler(this, manifest, appId, depotId);
         }
 
         var depots = await GetDepotsAsync(appId, cancellationToken: cancellationToken);
@@ -1438,6 +1442,17 @@ public class SteamContentClient : IAsyncDisposable
         var result = await SteamApps.RequestFreeLicense(appId).ToTask().WaitAsync(cancellationToken);
 
         return result.GrantedApps.Contains(appId);
+    }
+
+    // True when a manifest the caller already holds is the one this download needs
+    internal static bool IsManifestFor(
+        [NotNullWhen(true)] Manifest? manifest,
+        DepotId depotId,
+        ManifestId manifestId)
+    {
+        return manifest != null
+               && manifest.DepotId == depotId
+               && manifest.ManifestId == manifestId;
     }
 
     // Steam hands back null results when the request fails or times out
