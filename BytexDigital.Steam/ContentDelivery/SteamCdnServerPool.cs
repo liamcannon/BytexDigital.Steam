@@ -14,7 +14,7 @@ using SteamKit2.CDN;
 
 namespace BytexDigital.Steam.ContentDelivery
 {
-    public class SteamCdnServerPool : IDisposable
+    public class SteamCdnServerPool : IDisposable, IAsyncDisposable
     {
         private const int MinimumPoolSize = 10;
         private const int MaxThrottleDelaySeconds = 60;
@@ -31,6 +31,13 @@ namespace BytexDigital.Steam.ContentDelivery
         private readonly AsyncManualResetEvent _populatedEvent = new(false);
         private readonly AsyncAutoResetEvent _populatePoolEvent = new(true);
         private readonly SteamContentClient _steamContentClient;
+        private readonly Task? _monitorTask;
+
+        private readonly object _cdnOperationLock = new();
+        private int _activeCdnOperations;
+        private bool _disposeStarted;
+        private TaskCompletionSource<bool>? _cdnOperationsDrained;
+        private Task? _disposeTask;
 
         // The latest server-directory snapshot is also used as the source of recovery candidates.
         private Server[] _knownServerEndpoints = Array.Empty<Server>();
@@ -62,7 +69,7 @@ namespace BytexDigital.Steam.ContentDelivery
             CdnClient = new Client(_steamContentClient.SteamClient.InternalClient);
 
             // MonitorAsync handles its own errors, so it is safe to leave running on its own.
-            _ = Task.Run(MonitorAsync);
+            _monitorTask = Task.Run(MonitorAsync);
         }
 
         // <summary>
@@ -72,7 +79,8 @@ namespace BytexDigital.Steam.ContentDelivery
         internal SteamCdnServerPool(
             AppId appId,
             IEnumerable<Server> initialServers,
-            Func<DateTime> utcNow)
+            Func<DateTime> utcNow,
+            bool isPopulated = true)
         {
             ArgumentNullException.ThrowIfNull(initialServers);
             ArgumentNullException.ThrowIfNull(utcNow);
@@ -98,19 +106,123 @@ namespace BytexDigital.Steam.ContentDelivery
                 _availableServerEndpoints.Add(server);
             }
 
-            // The supplied snapshot is already populated; there is no monitor to wait for.
-            _populatedEvent.Set();
+            // The supplied snapshot is already populated unless a test specifies otherwise.
+            if (isPopulated)
+            {
+                _populatedEvent.Set();
+            }
         }
 
         public void Dispose()
         {
-            Close();
-            _cancellationTokenSource.Dispose();
+            DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            TaskCompletionSource<bool> completion;
+            Task activeOperationsDrained;
+
+            lock (_cdnOperationLock)
+            {
+                if (_disposeTask != null)
+                {
+                    return new ValueTask(_disposeTask);
+                }
+
+                _disposeStarted = true;
+
+                activeOperationsDrained = _activeCdnOperations == 0
+                    ? Task.CompletedTask
+                    : (_cdnOperationsDrained ??= new TaskCompletionSource<bool>(
+                        TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+
+                completion = new TaskCompletionSource<bool>(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+
+                _disposeTask = completion.Task;
+            }
+
+            _ = DisposeCoreAsync(activeOperationsDrained, completion);
+
+            return new ValueTask(completion.Task);
+        }
+
+        private async Task DisposeCoreAsync(
+            Task activeOperationsDrained,
+            TaskCompletionSource<bool> completion)
+        {
+            try
+            {
+                Close();
+
+                // Wait for active CDN requests and the background monitor to finish
+                // before disposing resources used by the pool.
+                await Task.WhenAll(
+                    activeOperationsDrained,
+                    _monitorTask ?? Task.CompletedTask)
+                    .ConfigureAwait(false);
+
+                try
+                {
+                    CdnClient?.Dispose();
+                }
+                finally
+                {
+                    _cancellationTokenSource.Dispose();
+                }
+
+                completion.TrySetResult(true);
+            }
+            catch (Exception ex)
+            {
+                completion.TrySetException(ex);
+            }
         }
 
         public void Close()
         {
             _cancellationTokenSource.Cancel();
+        }
+
+        /// <summary>
+        ///      Executes a CDN operation while tracking its active lifetime.
+        /// </summary>
+        /// <remarks>
+        ///      Tracking remains active until the underlying operation completes,
+        ///      even if the caller stops awaiting its result.
+        /// </remarks>
+        internal async Task<TResult> ExecuteCdnOperationAsync<TResult>(
+            Func<Client, Task<TResult>> operation)
+        {
+            ArgumentNullException.ThrowIfNull(operation);
+
+            lock (_cdnOperationLock)
+            {
+                ObjectDisposedException.ThrowIf(_disposeStarted, this);
+                _activeCdnOperations++;
+            }
+
+            try
+            {
+                return await operation(CdnClient).ConfigureAwait(false);
+            }
+            finally
+            {
+                TaskCompletionSource<bool>? operationsDrained = null;
+
+                lock (_cdnOperationLock)
+                {
+                    _activeCdnOperations--;
+
+                    if (_disposeStarted && _activeCdnOperations == 0)
+                    {
+                        operationsDrained = _cdnOperationsDrained;
+                    }
+                }
+
+                operationsDrained?.TrySetResult(true);
+            }
         }
 
         /// <summary>
@@ -151,7 +263,7 @@ namespace BytexDigital.Steam.ContentDelivery
                 Server? server;
                 if (!_activeServerEndpoints.TryPop(out server))
                 {
-                    if (_availableServerEndpoints.Count < MinimumPoolSize && !_populatedEvent.IsSet)
+                    if (_availableServerEndpoints.Count < MinimumPoolSize && _populatedEvent.IsSet)
                     {
                         Logger?.LogTrace("GetServer: Set populatePoolEvent");
                         _populatePoolEvent.Set();
