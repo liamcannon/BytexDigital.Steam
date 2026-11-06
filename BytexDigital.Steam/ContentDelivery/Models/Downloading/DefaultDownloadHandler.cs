@@ -461,223 +461,229 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
         private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
         {
-        const int maxAttempts = 5;
-		    var serverPool = _serverPool
+            const int maxAttempts = 5;
+            var serverPool = _serverPool
                 ?? throw new InvalidOperationException(
                     "The CDN server pool has not been initialized or is no longer available.");
 
-        var depotKey = _depotKey
-            ?? throw new InvalidOperationException(
-                "The depot key has not been initialized. SetupAsync must complete before downloading chunks.");
+            var depotKey = _depotKey
+                ?? throw new InvalidOperationException(
+                    "The depot key has not been initialized. SetupAsync must complete before downloading chunks.");
 
-        var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
-        var writtenBytes = 0;
-        Server? serverForAuthRetry = null;
+            var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
+            var writtenBytes = 0;
+            CdnServerLease? serverLeaseForAuthRetry = null;
+            var recoveryProbeAttempted = false;
 
-        for (var attempt = 1; attempt <= maxAttempts; attempt++)
-        {
-            var retryingWithReplacementToken = serverForAuthRetry != null;
-            var retainServerForRetry = false;
-
-            Server? server = serverForAuthRetry;
-            serverForAuthRetry = null;
-
-            string? cdnAuthToken = null;
-
-            try
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                server ??= serverPool.GetServer(cancellationToken);
-                cdnAuthToken = await ContentClient.GetCdnAuthTokenForDownloadAsync(
-                    AppId,
-                    DepotId,
-                    server,
-                    cancellationToken).ConfigureAwait(false);
+                var serverLease = serverLeaseForAuthRetry;
+                var retryingWithReplacementToken = serverLease.HasValue;
+                var retainServerForRetry = false;
+                serverLeaseForAuthRetry = null;
 
-                Logger?.LogDebug(
-                    "Chunk {ChunkId} in file {FileName}, depot {DepotId}: attempt {Attempt} of {MaxAttempts} via {Host} ({Type}, China-only: {ChinaOnly}), auth token supplied: {HasToken}.",
-                    chunkJob.InternalChunk.ChunkID,
-                    chunkJob.ManifestFile.FileName,
-                    DepotId,
-                    attempt,
-                    maxAttempts,
-                    server.Host,
-                    server.Type,
-                    server.SteamChinaOnly,
-                    !string.IsNullOrWhiteSpace(cdnAuthToken));
+                var server = serverLease?.Server;
+                string? cdnAuthToken = null;
+                var disposition = CdnServerDisposition.Abandoned;
+                var cdnRequestStarted = false;
 
-                writtenBytes = await serverPool.CdnClient.DownloadDepotChunkAsync(
-                    DepotId,
-                    chunkJob.InternalChunk,
-                    server,
-                    downloadedData,
-                    depotKey,
-                    serverPool.DesignatedProxyServer,
-                    cdnAuthToken)
-                    .ConfigureAwait(false);
-
-                serverPool.ReturnServer(server, false);
-                server = null;
-
-                break;
-            }
-            catch (OperationCanceledException)
-                when (cancellationToken.IsCancellationRequested)
-            {
-                if (server != null)
+                try
                 {
-                    serverPool.ReturnServer(server, false);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    serverLease ??= serverPool.GetServerForDownload(
+                        cancellationToken,
+                        allowRecoveryProbe: !recoveryProbeAttempted);
+                    server = serverLease.Value.Server;
+
+                    if (serverLease.Value.RecoveryProbe.HasValue)
+                    {
+                        recoveryProbeAttempted = true;
+                    }
+
+                    cdnAuthToken = await ContentClient.GetCdnAuthTokenForDownloadAsync(
+                        AppId,
+                        DepotId,
+                        server,
+                        cancellationToken).ConfigureAwait(false);
+
+                    Logger?.LogDebug(
+                        "Chunk {ChunkId} in file {FileName}, depot {DepotId}: attempt {Attempt} of {MaxAttempts} via {Host} ({Type}, China-only: {ChinaOnly}), auth token supplied: {HasToken}.",
+                        chunkJob.InternalChunk.ChunkID,
+                        chunkJob.ManifestFile.FileName,
+                        DepotId,
+                        attempt,
+                        maxAttempts,
+                        server.Host,
+                        server.Type,
+                        server.SteamChinaOnly,
+                        !string.IsNullOrWhiteSpace(cdnAuthToken));
+
+                    // Only failures from the actual CDN request are evidence about server health.
+                    cdnRequestStarted = true;
+                    writtenBytes = await serverPool.CdnClient.DownloadDepotChunkAsync(
+                        DepotId,
+                        chunkJob.InternalChunk,
+                        server,
+                        downloadedData,
+                        depotKey,
+                        serverPool.DesignatedProxyServer,
+                        cdnAuthToken)
+                        .ConfigureAwait(false);
+
+                    disposition = CdnServerDisposition.Succeeded;
+                    break;
                 }
-
-                throw;
-            }
-            catch (SteamNoContentServerFoundException ex)
-            {
-                if (server != null)
+                catch (OperationCanceledException)
                 {
-                    serverPool.ReturnServer(server, false);
+                    // Cancellation or an abandoned operation is not evidence that the endpoint is unhealthy.
+                    disposition = CdnServerDisposition.Abandoned;
+                    throw;
                 }
-
-                throw new SteamDownloadException(ex);
-            }
-            catch (Exception ex)
-            {
-                if (server != null)
+                catch (SteamNoContentServerFoundException ex)
                 {
-                    var forbidden = server.Type == "CDN" &&
-                        ex is SteamKit2.SteamKitWebRequestException
-                            { StatusCode: HttpStatusCode.Forbidden };
+                    disposition = CdnServerDisposition.Abandoned;
+                    throw new SteamDownloadException(ex);
+                }
+                catch (Exception ex)
+                {
+                    disposition = cdnRequestStarted
+                        ? CdnServerDisposition.Failed
+                        : CdnServerDisposition.Abandoned;
 
-                    CdnAuthRecoveryAction recoveryAction;
-
-                    try
+                    if (server is not null)
                     {
-                        recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
-                            isCdnServer: server.Type == "CDN",
-                            isForbidden: forbidden,
-                            retryingWithReplacementToken: retryingWithReplacementToken,
-                            canRetry: attempt < maxAttempts,
-                            refreshTokenAsync: tokenCancellationToken =>
-                                ContentClient.RefreshCdnAuthTokenAsync(
-                                    AppId,
-                                    DepotId,
-                                    server,
-                                    cdnAuthToken,
-                                    tokenCancellationToken),
-                            invalidateRejectedTokenAsync: async tokenCancellationToken =>
-                            {
-                                await ContentClient.InvalidateCdnAuthTokenIfMatchesAsync(
-                                    DepotId,
-                                    server,
-                                    cdnAuthToken,
-                                    tokenCancellationToken).ConfigureAwait(false);
-                            },
-                            cancellationToken: cancellationToken).ConfigureAwait(false);
+                        var forbidden = server.Type == "CDN" &&
+                            ex is SteamKit2.SteamKitWebRequestException
+                                { StatusCode: HttpStatusCode.Forbidden };
+
+                        CdnAuthRecoveryAction recoveryAction;
+
+                        try
+                        {
+                            recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
+                                isCdnServer: server.Type == "CDN",
+                                isForbidden: forbidden,
+                                retryingWithReplacementToken: retryingWithReplacementToken,
+                                canRetry: attempt < maxAttempts,
+                                refreshTokenAsync: tokenCancellationToken =>
+                                    ContentClient.RefreshCdnAuthTokenAsync(
+                                        AppId,
+                                        DepotId,
+                                        server,
+                                        cdnAuthToken,
+                                        tokenCancellationToken),
+                                invalidateRejectedTokenAsync: async tokenCancellationToken =>
+                                {
+                                    await ContentClient.InvalidateCdnAuthTokenIfMatchesAsync(
+                                        DepotId,
+                                        server,
+                                        cdnAuthToken,
+                                        tokenCancellationToken).ConfigureAwait(false);
+                                },
+                                cancellationToken: cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            disposition = CdnServerDisposition.Abandoned;
+                            throw;
+                        }
+
+                        if (recoveryAction == CdnAuthRecoveryAction.RetrySameServer)
+                        {
+                            // Keep the same lease (including a recovery-probe lease) checked out while
+                            // retrying the CDN request with the replacement authentication token.
+                            serverLeaseForAuthRetry = serverLease;
+                            retainServerForRetry = true;
+                        }
+
+                        var recoveryOutcome = recoveryAction switch
+                        {
+                            CdnAuthRecoveryAction.RetrySameServer =>
+                                "Retrying same server once with replacement auth token",
+                            CdnAuthRecoveryAction.DropServer =>
+                                "Dropping server; will try another eligible server if attempts remain",
+                            _ =>
+                                "No CDN auth recovery"
+                        };
+
+                        if (forbidden)
+                        {
+                            Logger?.LogWarning(
+                                "HTTP 403 from CDN {Host} for chunk {ChunkId} " +
+                                "in file {FileName}, depot {DepotId}. " +
+                                "Attempt {Attempt} of {MaxAttempts}. " +
+                                "China-only: {ChinaOnly}. " +
+                                "Auth token supplied: {HasToken}. " +
+                                "Recovery action: {RecoveryAction}.",
+                                server.Host,
+                                chunkJob.InternalChunk.ChunkID,
+                                chunkJob.ManifestFile.FileName,
+                                DepotId,
+                                attempt,
+                                maxAttempts,
+                                server.SteamChinaOnly,
+                                !string.IsNullOrWhiteSpace(cdnAuthToken),
+                                recoveryOutcome);
+                        }
                     }
-                    catch (OperationCanceledException)
-                        when (cancellationToken.IsCancellationRequested)
+
+                    Logger?.LogWarning(
+                        ex,
+                        "Attempt {Attempt} of {MaxAttempts} failed for chunk {ChunkId} in file {FileName}.",
+                        attempt,
+                        maxAttempts,
+                        chunkJob.InternalChunk.ChunkID,
+                        chunkJob.ManifestFile.FileName);
+
+                    if (attempt == maxAttempts)
                     {
-                        serverPool.ReturnServer(server, false);
-                        throw;
-                    }
-
-                    var retryable =
-                        recoveryAction == CdnAuthRecoveryAction.RetrySameServer;
-
-                    if (retryable)
-                    {
-                        // Keep this server checked out for the immediate retry.
-                        serverForAuthRetry = server;
-                        retainServerForRetry = true;
-                    }
-
-                    var recoveryOutcome = recoveryAction switch
-                    {
-                        CdnAuthRecoveryAction.RetrySameServer =>
-                            "Retrying same server once with replacement auth token",
-
-                        CdnAuthRecoveryAction.DropServer =>
-                            "Dropping server; will try another eligible server if attempts remain",
-
-                        _ =>
-                            "No CDN auth recovery"
-                    };
-
-                    if (forbidden)
-                    {
-                        Logger?.LogWarning(
-                            "HTTP 403 from CDN {Host} for chunk {ChunkId} " +
-                            "in file {FileName}, depot {DepotId}. " +
-                            "Attempt {Attempt} of {MaxAttempts}. " +
-                            "China-only: {ChinaOnly}. " +
-                            "Auth token supplied: {HasToken}. " +
-                            "Recovery action: {RecoveryAction}.",
-                            server.Host,
-                            chunkJob.InternalChunk.ChunkID,
-                            chunkJob.ManifestFile.FileName,
-                            DepotId,
-                            attempt,
-                            maxAttempts,
-                            server.SteamChinaOnly,
-                            !string.IsNullOrWhiteSpace(cdnAuthToken),
-                            recoveryOutcome);
+                        throw new SteamDownloadException(ex);
                     }
 
                     if (!retainServerForRetry)
                     {
-                        serverPool.ReturnServer(server, !retryable);
+                        await Task.Delay(
+                            TimeSpan.FromSeconds(attempt),
+                            cancellationToken).ConfigureAwait(false);
                     }
                 }
+                finally
+                {
+                    if (serverLease.HasValue && !retainServerForRetry)
+                    {
+                        serverPool.ReturnServer(serverLease.Value, disposition);
+                    }
+                }
+            }
 
-                Logger?.LogWarning(
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                await chunkJob.FileWriter.WriteAsync(
+                    chunkJob.InternalChunk.Offset,
+                    downloadedData[0..writtenBytes])
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logger?.LogError(
                     ex,
-                    "Attempt {Attempt} of {MaxAttempts} failed for chunk {ChunkId} in file {FileName}.",
-                    attempt,
-                    maxAttempts,
+                    "Failed to write chunk {ChunkId} to file {FileName}.",
                     chunkJob.InternalChunk.ChunkID,
                     chunkJob.ManifestFile.FileName);
 
-                if (attempt == maxAttempts)
-                {
-                    throw new SteamDownloadException(ex);
-                }
-
-                if (!retainServerForRetry)
-                {
-                    await Task.Delay(
-                        TimeSpan.FromSeconds(attempt),
-                        cancellationToken).ConfigureAwait(false);
-                }
+                throw;
             }
-        }
 
-        cancellationToken.ThrowIfCancellationRequested();
-
-        try
-        {
-            await chunkJob.FileWriter.WriteAsync(
-                chunkJob.InternalChunk.Offset,
-                downloadedData[0..writtenBytes])
-                .ConfigureAwait(false);
+            Logger?.LogTrace("Completed downloading chunk");
         }
-        catch (OperationCanceledException)
-            when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            Logger?.LogError(
-                ex,
-                "Failed to write chunk {ChunkId} to file {FileName}.",
-                chunkJob.InternalChunk.ChunkID,
-                chunkJob.ManifestFile.FileName);
-
-            throw;
-        }
-
-        Logger?.LogTrace("Completed downloading chunk");
-    }
 
         public async ValueTask DisposeAsync()
         {

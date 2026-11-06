@@ -115,33 +115,42 @@ public class SteamContentClient : IAsyncDisposable
 
         await SteamClient.AwaitReadyAsync(cancellationToken);
 
-        // The key does not depend on which CDN server answers, so get it once, up front. A failure here
-        // then stops the download straight away, instead of costing attempts and dropped servers.
-        var depotKey = await GetDepotKeyAsync(depotId, appId).WaitAsync(cancellationToken);
-
         var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
 
         var attempts = 0;
         const int maxAttempts = 5;
 
         Exception? lastException = null;
-        Server? serverForAuthRetry = null;
+        CdnServerLease? serverLeaseForAuthRetry = null;
+        var recoveryProbeAttempted = false;
 
         while (attempts < maxAttempts)
         {
-            // Keep a server checked out while its replacement-token retry is pending.
-            Server? server = serverForAuthRetry;
-            var retryingWithReplacementToken = server != null;
+            // Keep the same lease checked out while an authentication-token replacement retry is pending.
+            CdnServerLease? serverLease = serverLeaseForAuthRetry;
+            var retryingWithReplacementToken = serverLease.HasValue;
             var retainServerForRetry = false;
-            serverForAuthRetry = null;
+            serverLeaseForAuthRetry = null;
 
-            string? cdnAuthToken = null;
-            var healthy = false;
+            var server = serverLease?.Server;
+            var cdnAuthToken = (string?) null;
+            var disposition = CdnServerDisposition.Abandoned;
+            var cdnRequestStarted = false;
+            var cdnRequestSucceeded = false;
 
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                server ??= pool.GetServer(cancellationToken);
+                serverLease ??= pool.GetServerForDownload(
+                    cancellationToken,
+                    allowRecoveryProbe: !recoveryProbeAttempted);
+                server = serverLease.Value.Server;
+
+                if (serverLease.Value.RecoveryProbe.HasValue)
+                {
+                    recoveryProbeAttempted = true;
+                }
+
                 cdnAuthToken = await GetCdnAuthTokenForDownloadAsync(
                     appId,
                     depotId,
@@ -152,41 +161,61 @@ public class SteamContentClient : IAsyncDisposable
                     "Manifest {ManifestId} of depot {DepotId}: attempt {Attempt} of {MaxAttempts} via {Host} ({Type}), auth token: {HasToken}.",
                     manifestId, depotId, attempts + 1, maxAttempts, server.Host, server.Type, cdnAuthToken != null);
 
+                // Failures obtaining a depot key or manifest request code do not say anything about the CDN host.
+                var depotKey = await GetDepotKeyAsync(depotId, appId)
+                    .WaitAsync(cancellationToken);
+
                 var manifestCode =
                     await SteamClient._steamContentHandler.GetManifestRequestCode(depotId, appId, manifestId)
                         .WaitAsync(cancellationToken);
 
+                cdnRequestStarted = true;
                 var manifest =
                     await pool.CdnClient.DownloadManifestAsync(
                             depotId, manifestId, manifestCode, server, depotKey, pool.DesignatedProxyServer,
                             cdnAuthToken: cdnAuthToken)
                         .WaitAsync(cancellationToken);
 
+                // The CDN has successfully served the manifest. Filename decryption is a local operation and
+                // must not cause this endpoint to be marked unhealthy if it fails.
+                cdnRequestSucceeded = true;
+                disposition = CdnServerDisposition.Succeeded;
+
                 if (manifest.FilenamesEncrypted)
                 {
                     manifest.DecryptFilenames(depotKey);
                 }
 
-                healthy = true;
-                Logger?.LogDebug("Manifest {ManifestId} of depot {DepotId} downloaded via {Host}.", manifestId, depotId, server.Host);
+                Logger?.LogDebug(
+                    "Manifest {ManifestId} of depot {DepotId} downloaded via {Host}.",
+                    manifestId, depotId, server.Host);
                 return manifest;
             }
             catch (OperationCanceledException)
-                when (cancellationToken.IsCancellationRequested)
             {
-                // Cancellation is not evidence that the server is faulty.
-                healthy = true;
+                // Cancellation is not evidence that a server is faulty. For a recovery lease, Abandoned
+                // releases the probe without restoring the dropped endpoint.
+                disposition = CdnServerDisposition.Abandoned;
                 throw;
             }
             catch (Exception ex) when (ex is SteamAccessDeniedException or SteamNoContentServerFoundException)
             {
-                // Neither of these says anything about the server we are holding, so it goes back as healthy
-                healthy = true;
+                // Neither exception establishes whether the endpoint can serve CDN content.
+                disposition = CdnServerDisposition.Abandoned;
                 throw;
             }
             catch (Exception ex)
             {
                 lastException = ex;
+
+                if (cdnRequestStarted && !cdnRequestSucceeded)
+                {
+                    disposition = CdnServerDisposition.Failed;
+                }
+                else if (!cdnRequestStarted)
+                {
+                    disposition = CdnServerDisposition.Abandoned;
+                }
 
                 Logger?.LogWarning(
                     ex,
@@ -194,8 +223,8 @@ public class SteamContentClient : IAsyncDisposable
                     manifestId, depotId, server?.Host, attempts + 1,
                     (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
 
-                // A CDN gets one authentication-recovery attempt per download sequence.
-                // Keep it checked out while we retry using the replacement token.
+                // A CDN gets one authentication-recovery attempt per download sequence. Keep its lease
+                // checked out while retrying with the replacement token.
                 if (server is not null)
                 {
                     CdnAuthRecoveryAction recoveryAction;
@@ -215,36 +244,34 @@ public class SteamContentClient : IAsyncDisposable
                                     server,
                                     cdnAuthToken,
                                     tokenCancellationToken),
-                        invalidateRejectedTokenAsync: async tokenCancellationToken =>
-                        {
-                            await InvalidateCdnAuthTokenIfMatchesAsync(
-                                depotId,
-                                server,
-                                cdnAuthToken,
-                                tokenCancellationToken).ConfigureAwait(false);
-                        },
-                        cancellationToken: cancellationToken).ConfigureAwait(false);
+                            invalidateRejectedTokenAsync: async tokenCancellationToken =>
+                            {
+                                await InvalidateCdnAuthTokenIfMatchesAsync(
+                                    depotId,
+                                    server,
+                                    cdnAuthToken,
+                                    tokenCancellationToken).ConfigureAwait(false);
+                            },
+                            cancellationToken: cancellationToken).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException)
-                        when (cancellationToken.IsCancellationRequested)
                     {
-                        healthy = true;
+                        disposition = CdnServerDisposition.Abandoned;
                         throw;
                     }
 
                     if (recoveryAction == CdnAuthRecoveryAction.RetrySameServer)
                     {
-                        serverForAuthRetry = server;
+                        serverLeaseForAuthRetry = serverLease;
                         retainServerForRetry = true;
                     }
                 }
             }
             finally
             {
-                // A server that just worked goes back in the pool. Only one that failed is dropped.
-                if (server != null && !retainServerForRetry)
+                if (serverLease.HasValue && !retainServerForRetry)
                 {
-                    pool.ReturnServer(server, !healthy);
+                    pool.ReturnServer(serverLease.Value, disposition);
                 }
 
                 attempts += 1;
