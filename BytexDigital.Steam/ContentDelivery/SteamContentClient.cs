@@ -115,10 +115,6 @@ public class SteamContentClient : IAsyncDisposable
 
         await SteamClient.AwaitReadyAsync(cancellationToken);
 
-        // The key does not depend on which CDN server answers, so get it once, up front. A failure here
-        // then stops the download straight away, instead of costing attempts and dropped servers.
-        var depotKey = await GetDepotKeyAsync(depotId, appId).WaitAsync(cancellationToken);
-
         var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
 
         var attempts = 0;
@@ -166,7 +162,8 @@ public class SteamContentClient : IAsyncDisposable
                     manifestId, depotId, attempts + 1, maxAttempts, server.Host, server.Type, cdnAuthToken != null);
 
                 // Failures obtaining a depot key or manifest request code do not say anything about the CDN host.
-                var depotKey = await GetDepotKeyAsync(depotId, appId);
+                var depotKey = await GetDepotKeyAsync(depotId, appId)
+                    .WaitAsync(cancellationToken);
 
                 var manifestCode =
                     await SteamClient._steamContentHandler.GetManifestRequestCode(depotId, appId, manifestId)
