@@ -19,10 +19,18 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         public Func<ManifestFile, bool> FileCondition { get; protected set; } = null!;
         public DownloadHandlerStateEnum State { get; protected set; }
 
-        public LegacyDownloadHandler(string fileUrl, string fileName)
+        private readonly HttpClient _http;
+
+        public LegacyDownloadHandler(string fileUrl, string fileName) : this(fileUrl, fileName, Http)
+        {
+        }
+
+        // Lets tests supply a fake HTTP handler, so no real request is made
+        internal LegacyDownloadHandler(string fileUrl, string fileName, HttpClient http)
         {
             FileUrl = fileUrl;
             FileName = fileName;
+            _http = http;
             State = DownloadHandlerStateEnum.Created;
         }
 
@@ -78,10 +86,20 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                 State = DownloadHandlerStateEnum.Downloading;
 
+                // A legacy download is one file, so the condition either lets it through or skips it
+                var wanted = new ManifestFile(FileName, new List<ManifestFileChunkHeader>(), default, 0, Array.Empty<byte>());
+                if (!FileCondition(wanted))
+                {
+                    TotalProgress = 1;
+                    State = DownloadHandlerStateEnum.Downloaded;
+                    _ = Task.Run(() => DownloadComplete?.Invoke(this, EventArgs.Empty));
+                    return;
+                }
+
                 path = DownloadPathHelper.GetSafePath(DownloadDirectory, FileName);
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
-                using var response = await Http
+                using var response = await _http
                     .GetAsync(FileUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
                     .ConfigureAwait(false);
                 response.EnsureSuccessStatusCode();
