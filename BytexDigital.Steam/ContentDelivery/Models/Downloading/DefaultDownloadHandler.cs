@@ -327,8 +327,11 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 {
                     Logger?.LogTrace("Closing server pool");
 
-                    _serverPool?.Dispose();
-                    _serverPool = null;
+                    if (_serverPool != null)
+                    {
+                        await _serverPool.DisposeAsync().ConfigureAwait(false);
+                        _serverPool = null;
+                    }
                 }
             }
 
@@ -521,14 +524,15 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                     // Only failures from the actual CDN request are evidence about server health.
                     cdnRequestStarted = true;
-                    writtenBytes = await serverPool.CdnClient.DownloadDepotChunkAsync(
-                        DepotId,
-                        chunkJob.InternalChunk,
-                        server,
-                        downloadedData,
-                        depotKey,
-                        serverPool.DesignatedProxyServer,
-                        cdnAuthToken)
+                    writtenBytes = await serverPool.ExecuteCdnOperationAsync(
+                        cdnClient => cdnClient.DownloadDepotChunkAsync(
+                            DepotId,
+                            chunkJob.InternalChunk,
+                            server,
+                            downloadedData,
+                            depotKey,
+                            serverPool.DesignatedProxyServer,
+                            cdnAuthToken))
                         .ConfigureAwait(false);
 
                     disposition = CdnServerDisposition.Succeeded;
@@ -703,7 +707,10 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             // Dispose the server pool
             try
             {
-                _serverPool?.Dispose();
+                if (_serverPool != null)
+                {
+                    await _serverPool.DisposeAsync().ConfigureAwait(false);
+                }
             }
             catch
             {

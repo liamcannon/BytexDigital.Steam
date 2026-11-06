@@ -46,6 +46,9 @@ public class SteamContentClient : IAsyncDisposable
     private readonly ConcurrentDictionary<AppId, SteamCdnServerPool> _serverPools = new();
 
     private readonly AsyncLock _serverPoolsLock = new();
+    private readonly object _disposeLock = new();
+    private Task? _disposeTask;
+    private bool _disposeStarted;
 
     public CancellationToken CancellationToken => _cancellationTokenSource.Token;
     public SteamClient SteamClient { get; }
@@ -89,17 +92,40 @@ public class SteamContentClient : IAsyncDisposable
 
     public ValueTask DisposeAsync()
     {
-        foreach (var pool in _serverPools.Values)
+        lock (_disposeLock)
         {
-            pool.Dispose();
+            _disposeTask ??= DisposeCoreAsync();
+
+            return new ValueTask(_disposeTask);
+        }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
+        List<SteamCdnServerPool> pools;
+
+        {
+            using var lk = await _serverPoolsLock.LockAsync().ConfigureAwait(false);
+
+            _disposeStarted = true;
+
+            pools = _serverPools.Values.ToList();
+
+            _serverPools.Clear();
         }
 
-        _serverPools.Clear();
-
         _cancellationTokenSource.Cancel();
-        _cancellationTokenSource.Dispose();
 
-        return ValueTask.CompletedTask;
+        try
+        {
+            await Task.WhenAll(
+                pools.Select(pool => pool.DisposeAsync().AsTask()))
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _cancellationTokenSource.Dispose();
+        }
     }
 
     public async Task<Manifest> GetManifestAsync(
@@ -170,10 +196,18 @@ public class SteamContentClient : IAsyncDisposable
                         .WaitAsync(cancellationToken);
 
                 cdnRequestStarted = true;
+                // Keep caller cancellation outside the tracked operation.
+                // WaitAsync cancels the caller's wait, not the underlying SteamKit HTTP request.
                 var manifest =
-                    await pool.CdnClient.DownloadManifestAsync(
-                            depotId, manifestId, manifestCode, server, depotKey, pool.DesignatedProxyServer,
-                            cdnAuthToken: cdnAuthToken)
+                    await pool.ExecuteCdnOperationAsync(
+                            cdnClient => cdnClient.DownloadManifestAsync(
+                                depotId,
+                                manifestId,
+                                manifestCode,
+                                server,
+                                depotKey,
+                                pool.DesignatedProxyServer,
+                                cdnAuthToken: cdnAuthToken))
                         .WaitAsync(cancellationToken);
 
                 // The CDN has successfully served the manifest. Filename decryption is a local operation and
@@ -291,6 +325,8 @@ public class SteamContentClient : IAsyncDisposable
     {
         using var lk = await _serverPoolsLock.LockAsync(cancellationToken);
 
+        ObjectDisposedException.ThrowIf(_disposeStarted, this);
+
         if (_serverPools.TryGetValue(appId, out var serverPool))
         {
             if (!serverPool.IsExhausted)
@@ -299,7 +335,7 @@ public class SteamContentClient : IAsyncDisposable
             }
 
             // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
-            serverPool.Dispose();
+            await serverPool.DisposeAsync().ConfigureAwait(false);
         }
 
         serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
