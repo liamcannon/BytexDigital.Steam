@@ -34,9 +34,15 @@ namespace BytexDigital.Steam.ContentDelivery
         private readonly Task? _monitorTask;
 
         private readonly object _cdnOperationLock = new();
+
+        // Logical operations admitted to the pool.
         private int _activeCdnOperations;
+
+        // Underlying CDN HTTP requests that are still executing.
+        private int _activeCdnRequests;
+
         private bool _disposeStarted;
-        private TaskCompletionSource<bool>? _cdnOperationsDrained;
+        private TaskCompletionSource<bool>? _cdnWorkDrained;
         private Task? _disposeTask;
 
         // The latest server-directory snapshot is also used as the source of recovery candidates.
@@ -121,7 +127,7 @@ namespace BytexDigital.Steam.ContentDelivery
         public ValueTask DisposeAsync()
         {
             TaskCompletionSource<bool> completion;
-            Task activeOperationsDrained;
+            Task outstandingWorkDrained;
 
             lock (_cdnOperationLock)
             {
@@ -130,12 +136,14 @@ namespace BytexDigital.Steam.ContentDelivery
                     return new ValueTask(_disposeTask);
                 }
 
+                // Stop accepting new logical operations.
                 _disposeStarted = true;
 
-                activeOperationsDrained = _activeCdnOperations == 0
-                    ? Task.CompletedTask
-                    : (_cdnOperationsDrained ??= new TaskCompletionSource<bool>(
-                        TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+                outstandingWorkDrained =
+                    _activeCdnOperations == 0 && _activeCdnRequests == 0
+                        ? Task.CompletedTask
+                        : (_cdnWorkDrained ??= new TaskCompletionSource<bool>(
+                            TaskCreationOptions.RunContinuationsAsynchronously)).Task;
 
                 completion = new TaskCompletionSource<bool>(
                     TaskCreationOptions.RunContinuationsAsynchronously);
@@ -143,24 +151,24 @@ namespace BytexDigital.Steam.ContentDelivery
                 _disposeTask = completion.Task;
             }
 
-            _ = DisposeCoreAsync(activeOperationsDrained, completion);
+            _ = DisposeCoreAsync(outstandingWorkDrained, completion);
 
             return new ValueTask(completion.Task);
         }
 
         private async Task DisposeCoreAsync(
-            Task activeOperationsDrained,
+            Task outstandingWorkDrained,
             TaskCompletionSource<bool> completion)
         {
             try
             {
+                // Keep the pool and monitor operational while admitted work finishes.
+                await outstandingWorkDrained.ConfigureAwait(false);
+
+                // Only close the pool once no logical operations or HTTP requests remain.
                 Close();
 
-                // Wait for active CDN requests and the background monitor to finish
-                // before disposing resources used by the pool.
-                await Task.WhenAll(
-                    activeOperationsDrained,
-                    _monitorTask ?? Task.CompletedTask)
+                await (_monitorTask ?? Task.CompletedTask)
                     .ConfigureAwait(false);
 
                 try
@@ -186,21 +194,48 @@ namespace BytexDigital.Steam.ContentDelivery
         }
 
         /// <summary>
-        ///      Executes a CDN operation while tracking its active lifetime.
+        ///     Begins tracking a logical CDN operation.
+        /// </summary>
+        internal CdnOperationLease BeginCdnOperation()
+        {
+            lock (_cdnOperationLock)
+            {
+                ObjectDisposedException.ThrowIf(_disposeStarted, this);
+
+                _activeCdnOperations++;
+
+                return new CdnOperationLease(this);
+            }
+        }
+
+        /// <summary>
+        ///     Executes a CDN HTTP request associated with an admitted operation.
         /// </summary>
         /// <remarks>
-        ///      Tracking remains active until the underlying operation completes,
-        ///      even if the caller stops awaiting its result.
+        ///     HTTP request tracking continues until the underlying request completes,
+        ///     even if the caller stops awaiting its result.
         /// </remarks>
         internal async Task<TResult> ExecuteCdnOperationAsync<TResult>(
+            CdnOperationLease operationLease,
             Func<Client, Task<TResult>> operation)
         {
+            ArgumentNullException.ThrowIfNull(operationLease);
             ArgumentNullException.ThrowIfNull(operation);
 
             lock (_cdnOperationLock)
             {
-                ObjectDisposedException.ThrowIf(_disposeStarted, this);
-                _activeCdnOperations++;
+                if (!operationLease.BelongsTo(this))
+                {
+                    throw new ArgumentException(
+                        "The operation lease belongs to a different CDN server pool.",
+                        nameof(operationLease));
+                }
+
+                ObjectDisposedException.ThrowIf(
+                    operationLease.IsDisposed,
+                    operationLease);
+
+                _activeCdnRequests++;
             }
 
             try
@@ -209,20 +244,49 @@ namespace BytexDigital.Steam.ContentDelivery
             }
             finally
             {
-                TaskCompletionSource<bool>? operationsDrained = null;
+                TaskCompletionSource<bool>? workDrained = null;
 
                 lock (_cdnOperationLock)
                 {
-                    _activeCdnOperations--;
+                    _activeCdnRequests--;
 
-                    if (_disposeStarted && _activeCdnOperations == 0)
+                    if (_disposeStarted &&
+                        _activeCdnOperations == 0 &&
+                        _activeCdnRequests == 0)
                     {
-                        operationsDrained = _cdnOperationsDrained;
+                        workDrained = _cdnWorkDrained;
                     }
                 }
 
-                operationsDrained?.TrySetResult(true);
+                workDrained?.TrySetResult(true);
             }
+        }
+
+        /// <summary>
+        ///     Releases a logical CDN operation.
+        /// </summary>
+        internal void EndCdnOperation(CdnOperationLease operationLease)
+        {
+            TaskCompletionSource<bool>? workDrained = null;
+
+            lock (_cdnOperationLock)
+            {
+                if (!operationLease.TryMarkDisposed())
+                {
+                    return;
+                }
+
+                _activeCdnOperations--;
+
+                if (_disposeStarted &&
+                    _activeCdnOperations == 0 &&
+                    _activeCdnRequests == 0)
+                {
+                    workDrained = _cdnWorkDrained;
+                }
+            }
+
+            workDrained?.TrySetResult(true);
         }
 
         /// <summary>
@@ -263,7 +327,7 @@ namespace BytexDigital.Steam.ContentDelivery
                 Server? server;
                 if (!_activeServerEndpoints.TryPop(out server))
                 {
-                    if (_availableServerEndpoints.Count < MinimumPoolSize && _populatedEvent.IsSet)
+                    if (NeedsPopulation && _populatedEvent.IsSet)
                     {
                         Logger?.LogTrace("GetServer: Set populatePoolEvent");
                         _populatePoolEvent.Set();
@@ -507,6 +571,30 @@ namespace BytexDigital.Steam.ContentDelivery
             }
         }
 
+        // Servers that can be handed out right now: unused ones plus ones returned by finished
+        // operations. Copies of dropped servers are skipped when popped, so they leave this count soon after.
+        private int PooledServerCount => _availableServerEndpoints.Count + _activeServerEndpoints.Count;
+
+        private int _lastUsableServerCount;
+
+        internal int LastUsableServerCount
+        {
+            get => Volatile.Read(ref _lastUsableServerCount);
+            set => Volatile.Write(ref _lastUsableServerCount, value);
+        }
+
+        // How many idle servers the pool tries to keep. Normally MinimumPoolSize. If Steam last
+        // returned fewer usable servers than that, asking again cannot reach it, so only ask
+        // again once the pool has run completely dry.
+        private int PopulationLowWater =>
+            LastUsableServerCount is > 0 and < MinimumPoolSize ? 1 : MinimumPoolSize;
+
+        // True when idle servers (unused ones plus ones returned by finished operations) are below
+        // the low-water mark. Copies of dropped servers count until they are popped and skipped;
+        // if that leaves nothing, the next selection signals again.
+        internal bool NeedsPopulation =>
+            _availableServerEndpoints.Count + _activeServerEndpoints.Count < PopulationLowWater;
+
         private async Task MonitorAsync()
         {
             try
@@ -517,7 +605,7 @@ namespace BytexDigital.Steam.ContentDelivery
                     await WaitForPopulateRequestAsync().ConfigureAwait(false);
 
                     Logger?.LogTrace("MonitorAsync: Checking");
-                    if (_availableServerEndpoints.Count < MinimumPoolSize)
+                    if (NeedsPopulation)
                     {
                         Logger?.LogTrace("MonitorAsync: Pool will be populated");
                         _populatedEvent.Reset();
@@ -565,6 +653,7 @@ namespace BytexDigital.Steam.ContentDelivery
                         // In normal mode only healthy candidates enter the ordinary pool. If every
                         // candidate is dropped, exhaustion fallback intentionally refills with all of them.
                         var usable = exhaustionFallback ? candidates : healthy;
+                        LastUsableServerCount = usable.Count;
 
                         var added = 0;
                         foreach (var server in usable.OrderBy(x => x.WeightedLoad))
@@ -645,13 +734,61 @@ namespace BytexDigital.Steam.ContentDelivery
                         return Array.Empty<Server>();
                     }
 
-                    if (ex is SteamKitWebRequestException { StatusCode: HttpStatusCode.TooManyRequests })
+                    if (ex is SteamKitWebRequestException { StatusCode: HttpStatusCode.TooManyRequests } throttled)
                     {
                         throttleDelay = Math.Min(throttleDelay + 5, MaxThrottleDelaySeconds);
-                        await Task.Delay(TimeSpan.FromSeconds(throttleDelay), _token).ConfigureAwait(false);
+                        var delay = TimeSpan.FromSeconds(throttleDelay);
+
+                        // If Steam says how long to wait, never wait less than that, but cap it so a
+                        // huge value cannot stall the pool for minutes.
+                        var retryAfter = throttled.Headers?.RetryAfter?.Delta;
+                        if (retryAfter.HasValue && retryAfter.Value > delay)
+                        {
+                            delay = TimeSpan.FromSeconds(
+                                Math.Min(retryAfter.Value.TotalSeconds, MaxThrottleDelaySeconds));
+
+                            Logger?.LogDebug("Steam asked for a {Delay}s wait before the next server list request.", (int) delay.TotalSeconds);
+                        }
+
+                        await Task.Delay(delay, _token).ConfigureAwait(false);
                     }
                 }
             }
+        }
+    }
+
+    internal sealed class CdnOperationLease : IDisposable
+    {
+        private readonly SteamCdnServerPool _owner;
+        private bool _isDisposed;
+
+        internal CdnOperationLease(SteamCdnServerPool owner)
+        {
+            _owner = owner;
+        }
+
+        internal bool BelongsTo(SteamCdnServerPool pool)
+        {
+            return ReferenceEquals(_owner, pool);
+        }
+
+        // These state operations are performed under the owning pool's lock.
+        internal bool IsDisposed => _isDisposed;
+
+        internal bool TryMarkDisposed()
+        {
+            if (_isDisposed)
+            {
+                return false;
+            }
+
+            _isDisposed = true;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            _owner.EndCdnOperation(this);
         }
     }
 

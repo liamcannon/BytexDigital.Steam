@@ -141,7 +141,11 @@ public class SteamContentClient : IAsyncDisposable
 
         await SteamClient.AwaitReadyAsync(cancellationToken);
 
-        var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
+        var (pool, operationLease) = await BeginPoolOperationAsync(appId, cancellationToken);
+
+        // Held for the whole manifest download: server selection, auth token, depot key,
+        // request code, retries and auth recovery. Pool disposal waits for this.
+        using var leaseScope = operationLease;
 
         var attempts = 0;
         const int maxAttempts = 5;
@@ -200,6 +204,7 @@ public class SteamContentClient : IAsyncDisposable
                 // WaitAsync cancels the caller's wait, not the underlying SteamKit HTTP request.
                 var manifest =
                     await pool.ExecuteCdnOperationAsync(
+                            operationLease,
                             cdnClient => cdnClient.DownloadManifestAsync(
                                 depotId,
                                 manifestId,
@@ -317,6 +322,23 @@ public class SteamContentClient : IAsyncDisposable
         throw new SteamManifestDownloadException(
             $"Could not download the manifest = {manifestId} after {maxAttempts} attempts.",
             lastException);
+    }
+
+    // Gets the current pool for the app and admits an operation on it. If the pool was being
+    // replaced between those two steps, ask for the current one again.
+    private async Task<(SteamCdnServerPool Pool, CdnOperationLease Lease)> BeginPoolOperationAsync(
+        AppId appId,
+        CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var pool = await GetSteamCdnServerPoolAsync(appId, cancellationToken);
+
+            try
+            { return (pool, pool.BeginCdnOperation()); }
+            catch (ObjectDisposedException) when (attempt < 2)
+            { /* pool was replaced while we were asking, try again */ }
+        }
     }
 
     private async Task<SteamCdnServerPool> GetSteamCdnServerPoolAsync(
