@@ -348,45 +348,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
         }
 
-        private async Task ParallelAsync(
-            int maxParallel,
-            IEnumerable<Func<Task>> taskFactories,
-            CancellationToken cancellationToken)
-        {
-            var taskFactoriesSource = taskFactories.ToArray();
-
-            if (taskFactoriesSource.Length == 0)
-            {
-                return;
-            }
-
-            if (maxParallel <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(maxParallel));
-            }
-
-            var tasksRunning = new List<Task>(50);
-            var index = 0;
-
-            do
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                while (tasksRunning.Count < maxParallel && index < taskFactoriesSource.Length)
-                {
-                    var taskFactory = taskFactoriesSource[index++];
-
-                    tasksRunning.Add(taskFactory());
-                }
-
-                var completedTask = await Task.WhenAny(tasksRunning).ConfigureAwait(false);
-
-                await completedTask.ConfigureAwait(false);
-
-                tasksRunning.Remove(completedTask);
-            } while (index < taskFactoriesSource.Length || tasksRunning.Count != 0);
-        }
-
         private Task VerifyFileAsync(ManifestFile file, string directory, ConcurrentBag<ChunkJob> chunks)
         {
             var filePath = DownloadPathHelper.GetSafePath(
