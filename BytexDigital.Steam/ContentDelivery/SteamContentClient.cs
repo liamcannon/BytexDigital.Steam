@@ -32,6 +32,9 @@ public class SteamContentClient : IAsyncDisposable
 
     private readonly CancellationTokenSource _cancellationTokenSource;
 
+    // Read once at construction. Reading Token from a disposed source throws.
+    private readonly CancellationToken _cancellationToken;
+
     // Cache
     private readonly ConcurrentDictionary<DepotId, byte[]> _depotKeys = new();
 
@@ -50,7 +53,7 @@ public class SteamContentClient : IAsyncDisposable
     private Task? _disposeTask;
     private bool _disposeStarted;
 
-    public CancellationToken CancellationToken => _cancellationTokenSource.Token;
+    public CancellationToken CancellationToken => _cancellationToken;
     public SteamClient SteamClient { get; }
 
     public ILogger? Logger { get; set; }
@@ -88,6 +91,7 @@ public class SteamContentClient : IAsyncDisposable
                 "SteamKit did not provide the SteamUser handler.");
 
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(SteamClient.CancellationToken);
+        _cancellationToken = _cancellationTokenSource.Token;
     }
 
     public ValueTask DisposeAsync()
