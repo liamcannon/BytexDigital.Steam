@@ -475,6 +475,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
             var writtenBytes = 0;
+            // Held across every attempt, including auth recovery retries.
+            using var operationLease = serverPool.BeginCdnOperation();
+
             CdnServerLease? serverLeaseForAuthRetry = null;
             var recoveryProbeAttempted = false;
 
@@ -525,6 +528,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     // Only failures from the actual CDN request are evidence about server health.
                     cdnRequestStarted = true;
                     writtenBytes = await serverPool.ExecuteCdnOperationAsync(
+                        operationLease,
                         cdnClient => cdnClient.DownloadDepotChunkAsync(
                             DepotId,
                             chunkJob.InternalChunk,

@@ -62,6 +62,51 @@ public class SteamCdnServerPoolTests
     }
 
     [Fact]
+    public void ServersReturnedByFinishedOperationsCountTowardsPoolSize()
+    {
+        using var fixture = new PoolFixture(serverCount: 10);
+
+        var first = fixture.Pool.GetServerForDownload(allowRecoveryProbe: false);
+        var second = fixture.Pool.GetServerForDownload(allowRecoveryProbe: false);
+
+        Assert.True(fixture.Pool.NeedsPopulation);
+
+        fixture.Pool.ReturnServer(first, CdnServerDisposition.Succeeded);
+        fixture.Pool.ReturnServer(second, CdnServerDisposition.Succeeded);
+
+        Assert.False(fixture.Pool.NeedsPopulation);
+    }
+
+    [Fact]
+    public void FewerServersThanTheMinimumOnlyNeedPopulationWhenEmpty()
+    {
+        using var fixture = new PoolFixture(serverCount: 2, lastFetchUsable: 2);
+
+        Assert.False(fixture.Pool.NeedsPopulation);
+
+        fixture.Pool.GetServerForDownload(allowRecoveryProbe: false);
+        Assert.False(fixture.Pool.NeedsPopulation);
+
+        fixture.Pool.GetServerForDownload(allowRecoveryProbe: false);
+        Assert.True(fixture.Pool.NeedsPopulation);
+    }
+
+    [Fact]
+    public void DoesNotRequestPopulationWhenSteamGaveFewerServersThanTheMinimum()
+    {
+        using var fixture = new PoolFixture(serverCount: 2, lastFetchUsable: 2);
+        var logger = new RecordingLogger();
+
+        fixture.Pool.Logger = logger;
+
+        fixture.Pool.GetServerForDownload(allowRecoveryProbe: false);
+
+        Assert.DoesNotContain(
+            logger.Messages,
+            message => message.Contains("Set populatePoolEvent"));
+    }
+
+    [Fact]
     public async Task DisposeDisposesOwnedCdnHttpClient()
     {
         var handler = new TrackingHttpMessageHandler();
@@ -94,7 +139,10 @@ public class SteamCdnServerPoolTests
         var completeOperation = new TaskCompletionSource<int>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
+        using var lease = fixture.Pool.BeginCdnOperation();
+
         var operation = fixture.Pool.ExecuteCdnOperationAsync(
+            lease,
             async _ =>
             {
                 operationStarted.TrySetResult(true);
@@ -107,14 +155,45 @@ public class SteamCdnServerPoolTests
 
         Assert.False(disposal.IsCompleted);
 
-        await Assert.ThrowsAsync<ObjectDisposedException>(
-            () => fixture.Pool.ExecuteCdnOperationAsync<int>(
-                _ => Task.FromResult(1)));
+        // No new operations are admitted once disposal has started.
+        Assert.Throws<ObjectDisposedException>(() => fixture.Pool.BeginCdnOperation());
 
         completeOperation.SetResult(42);
 
         Assert.Equal(42, await operation);
+
+        // The request has finished but the operation is still admitted, so disposal keeps waiting.
+        Assert.False(disposal.IsCompleted);
+
+        lease.Dispose();
         await disposal;
+    }
+
+    [Fact]
+    public async Task AdmittedLeaseCanStillRequestAfterDisposeStartsAndReleasesOnce()
+    {
+        using var fixture = new PoolFixture();
+        using var lease = fixture.Pool.BeginCdnOperation();
+        using var other = fixture.Pool.BeginCdnOperation();
+
+        var firstDispose = fixture.Pool.DisposeAsync().AsTask();
+        var secondDispose = fixture.Pool.DisposeAsync().AsTask();
+
+        // Concurrent disposal calls share one disposal.
+        Assert.Same(firstDispose, secondDispose);
+
+        // Admitted before disposal started, so it may still make its request.
+        Assert.Equal(
+            7,
+            await fixture.Pool.ExecuteCdnOperationAsync(lease, _ => Task.FromResult(7)));
+
+        // Releasing the same lease twice releases it once, so the other lease still holds disposal.
+        lease.Dispose();
+        lease.Dispose();
+        Assert.False(firstDispose.IsCompleted);
+
+        other.Dispose();
+        await firstDispose.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
     [Fact]
@@ -122,6 +201,7 @@ public class SteamCdnServerPoolTests
     {
         using var fixture = new PoolFixture();
         using var cancellation = new CancellationTokenSource();
+        using var lease = fixture.Pool.BeginCdnOperation();
 
         var operationStarted = new TaskCompletionSource<bool>(
             TaskCreationOptions.RunContinuationsAsynchronously);
@@ -130,6 +210,7 @@ public class SteamCdnServerPoolTests
             TaskCreationOptions.RunContinuationsAsynchronously);
 
         var operation = fixture.Pool.ExecuteCdnOperationAsync(
+            lease,
             async _ =>
             {
                 operationStarted.TrySetResult(true);
@@ -137,6 +218,10 @@ public class SteamCdnServerPoolTests
             });
 
         await operationStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Release the logical operation, so only the in-flight request keeps the pool open.
+        // Without this the lease alone would hold disposal and the test would prove nothing.
+        lease.Dispose();
 
         var callerWait = operation.WaitAsync(cancellation.Token);
 
@@ -372,7 +457,7 @@ public class SteamCdnServerPoolTests
 
         public SteamCdnServerPool Pool { get; }
 
-        public PoolFixture(bool isPopulated = true, int serverCount = 2)
+        public PoolFixture(bool isPopulated = true, int serverCount = 2, int? lastFetchUsable = null)
         {
             var servers = new List<Server>
             {
@@ -390,6 +475,11 @@ public class SteamCdnServerPoolTests
                 servers,
                 () => _utcNow,
                 isPopulated);
+
+            if (lastFetchUsable.HasValue)
+            {
+                Pool.LastUsableServerCount = lastFetchUsable.Value;
+            }
         }
 
         public void Advance(TimeSpan duration)
