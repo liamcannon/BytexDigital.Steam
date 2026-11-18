@@ -1197,27 +1197,24 @@ public class SteamContentClient : IAsyncDisposable
         }
 
         var manifest = depot.Manifests.FirstOrDefault();
-        var encryptedManifest = depot.EncryptedManifests.FirstOrDefault();
 
         if (manifest != null)
         {
             return manifest.ManifestId;
         }
 
-        if (encryptedManifest != null)
+        // GetDepotsAsync drops depots that have no manifest at all for the requested branch,
+        // so a depot without a plain manifest here always has an encrypted one.
+        var encryptedManifest = depot.EncryptedManifests.First();
+
+        if (branchPassword == null)
         {
-            if (branchPassword == null)
-            {
-                throw new SteamInvalidBranchPasswordException(appId, depotId, branch);
-            }
-
-            manifest = await DecryptDepotManifestAsync(encryptedManifest, branchPassword);
-
-            return manifest.ManifestId;
+            throw new SteamInvalidBranchPasswordException(appId, depotId, branch);
         }
 
-        throw new ArgumentException(
-            $"Combination of app id = {appId}, depot id = {depotId} and branch = {branch} could not be found.");
+        manifest = await DecryptDepotManifestAsync(encryptedManifest, branchPassword);
+
+        return manifest.ManifestId;
     }
 
     internal async Task<IDownloadHandler> GetAppDataInternalAsync(
