@@ -361,25 +361,44 @@ public class SteamContentClient : IAsyncDisposable
         AppId appId,
         CancellationToken cancellationToken = default)
     {
-        using var lk = await _serverPoolsLock.LockAsync(cancellationToken);
+        SteamCdnServerPool serverPool;
+        SteamCdnServerPool? replacedPool = null;
 
-        ObjectDisposedException.ThrowIf(_disposeStarted, this);
-
-        if (_serverPools.TryGetValue(appId, out var serverPool))
+        using (await _serverPoolsLock.LockAsync(cancellationToken))
         {
-            if (!serverPool.IsExhausted)
+            ObjectDisposedException.ThrowIf(_disposeStarted, this);
+
+            if (_serverPools.TryGetValue(appId, out var existingPool))
             {
-                return serverPool;
+                if (!existingPool.IsExhausted)
+                {
+                    return existingPool;
+                }
+
+                // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
+                replacedPool = existingPool;
             }
 
-            // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
-            await serverPool.DisposeAsync().ConfigureAwait(false);
+            serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
+            _serverPools[appId] = serverPool;
         }
 
-        serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
-        _serverPools[appId] = serverPool;
+        if (replacedPool != null)
+        {
+            // Disposal waits for work admitted on the old pool. That must never happen while holding the
+            // lock, because every other lookup, for any app, would wait behind it.
+            _ = DisposeReplacedPoolAsync(replacedPool);
+        }
 
         return serverPool;
+    }
+
+    private async Task DisposeReplacedPoolAsync(SteamCdnServerPool pool)
+    {
+        try
+        { await pool.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception ex)
+        { Logger?.LogWarning(ex, "Disposing a replaced CDN server pool failed."); }
     }
 
     private static string CdnKey(DepotId depotId, string host) =>
