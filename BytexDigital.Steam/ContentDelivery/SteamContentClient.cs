@@ -260,12 +260,6 @@ public class SteamContentClient : IAsyncDisposable
                     disposition = CdnServerDisposition.Abandoned;
                 }
 
-                Logger?.LogWarning(
-                    ex,
-                    "Manifest {ManifestId} of depot {DepotId} failed via {Host} on attempt {Attempt} ({Status}).",
-                    manifestId, depotId, server?.Host, attempts + 1,
-                    (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
-
                 // A CDN gets one authentication-recovery attempt per download sequence. Keep its lease
                 // checked out while retrying with the replacement token.
                 if (server is not null)
@@ -308,6 +302,24 @@ public class SteamContentClient : IAsyncDisposable
                         serverLeaseForAuthRetry = serverLease;
                         retainServerForRetry = true;
                     }
+                }
+
+                if (retainServerForRetry)
+                {
+                    // A 403 that is about to be retried once with a replacement token is expected to be
+                    // fixed by that retry, so it does not need a stack trace.
+                    Logger?.LogWarning(
+                        "HTTP 403 from CDN {Host} for manifest {ManifestId} of depot {DepotId}. " +
+                        "Attempt {Attempt} of {MaxAttempts}. Retrying same server once with replacement auth token.",
+                        server?.Host, manifestId, depotId, attempts + 1, maxAttempts);
+                }
+                else
+                {
+                    Logger?.LogWarning(
+                        ex,
+                        "Manifest {ManifestId} of depot {DepotId} failed via {Host} on attempt {Attempt} ({Status}).",
+                        manifestId, depotId, server?.Host, attempts + 1,
+                        (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
                 }
             }
             finally

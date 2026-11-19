@@ -597,13 +597,18 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                         }
                     }
 
-                    Logger?.LogWarning(
-                        ex,
-                        "Attempt {Attempt} of {MaxAttempts} failed for chunk {ChunkId} in file {FileName}.",
-                        attempt,
-                        maxAttempts,
-                        chunkJob.InternalChunk.ChunkID,
-                        chunkJob.ManifestFile.FileName);
+                    // A 403 that is about to be retried once with a replacement token has already been logged
+                    // as one line above. Every other failure keeps the full exception.
+                    if (!retainServerForRetry)
+                    {
+                        Logger?.LogWarning(
+                            ex,
+                            "Attempt {Attempt} of {MaxAttempts} failed for chunk {ChunkId} in file {FileName}.",
+                            attempt,
+                            maxAttempts,
+                            chunkJob.InternalChunk.ChunkID,
+                            chunkJob.ManifestFile.FileName);
+                    }
 
                     if (attempt == maxAttempts)
                     {
