@@ -1142,11 +1142,31 @@ public class SteamContentClient : IAsyncDisposable
     [SuppressMessage("Security", "CA5358", Justification = "Same reason: AES-ECB is dictated by Steam.")]
     internal static DepotManifest DecryptManifestId(DepotEncryptedManifest manifest, byte[] key)
     {
+        // A malformed id says nothing about the password, so it is reported separately from a
+        // decryption failure. This has to sit outside the try below, which treats failures as a wrong password.
+        byte[] encryptedManifestIdBytes;
         try
         {
-            // Inside the try, so a malformed id is reported the same way as a wrong password
-            var encryptedManifestIdBytes = DecodeHexString(manifest.EncryptedManifestId);
+            var hex = manifest.EncryptedManifestId;
+            if (string.IsNullOrEmpty(hex) || hex.Length % 2 != 0)
+            {
+                throw new FormatException("it must be a non-empty hex string with an even number of characters.");
+            }
 
+            encryptedManifestIdBytes = DecodeHexString(hex);
+        }
+        catch (Exception ex) when (ex is FormatException or ArgumentException or OverflowException)
+        {
+            throw new SteamInvalidBranchPasswordException(
+                manifest.AppId,
+                manifest.DepotId,
+                manifest.BranchName,
+                ex.Message,
+                ex);
+        }
+
+        try
+        {
             using var aes = Aes.Create();
             aes.BlockSize = 128;
             aes.KeySize = 256;
