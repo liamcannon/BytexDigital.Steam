@@ -39,9 +39,23 @@ public class DecryptManifestIdTests
     [InlineData("zz")]
     [InlineData("ABC")]
     [InlineData("")]
-    public void MalformedIdsAreReportedAsInvalidPassword(string hex)
+    public void MalformedIdsAreReportedAsMalformedNotAsAWrongPassword(string hex)
     {
-        Assert.Throws<SteamInvalidBranchPasswordException>(
+        var ex = Assert.Throws<SteamInvalidBranchPasswordException>(
             () => SteamContentClient.DecryptManifestId(Encrypted(hex), Key));
+
+        Assert.Contains("could not be read", ex.Message);
+        Assert.DoesNotContain("Invalid password", ex.Message);
+    }
+
+    [Fact]
+    public void WrongKeyIsStillReportedAsAnInvalidPassword()
+    {
+        var wrongKey = Enumerable.Range(101, 32).Select(i => (byte) i).ToArray();
+
+        var ex = Assert.Throws<SteamInvalidBranchPasswordException>(
+            () => SteamContentClient.DecryptManifestId(Encrypted(EncryptToHex(123456789UL)), wrongKey));
+
+        Assert.Contains("Invalid password", ex.Message);
     }
 }

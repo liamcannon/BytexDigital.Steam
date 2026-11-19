@@ -15,5 +15,17 @@ namespace BytexDigital.Steam.ContentDelivery.Exceptions
             innerException)
         {
         }
+
+        // For an encrypted manifest id that could not be read at all. That says nothing about the password.
+        public SteamInvalidBranchPasswordException(
+            AppId appId,
+            DepotId depotId,
+            string branch,
+            string reason,
+            Exception? innerException) : base(
+            $"The encrypted manifest id for branch = {branch} of app id = {appId}, depot id = {depotId} could not be read: {reason}",
+            innerException)
+        {
+        }
     }
 }

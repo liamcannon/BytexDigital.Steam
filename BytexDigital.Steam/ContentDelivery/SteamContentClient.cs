@@ -32,6 +32,9 @@ public class SteamContentClient : IAsyncDisposable
 
     private readonly CancellationTokenSource _cancellationTokenSource;
 
+    // Read once at construction. Reading Token from a disposed source throws.
+    private readonly CancellationToken _cancellationToken;
+
     // Cache
     private readonly ConcurrentDictionary<DepotId, byte[]> _depotKeys = new();
 
@@ -50,7 +53,7 @@ public class SteamContentClient : IAsyncDisposable
     private Task? _disposeTask;
     private bool _disposeStarted;
 
-    public CancellationToken CancellationToken => _cancellationTokenSource.Token;
+    public CancellationToken CancellationToken => _cancellationToken;
     public SteamClient SteamClient { get; }
 
     public ILogger? Logger { get; set; }
@@ -88,6 +91,7 @@ public class SteamContentClient : IAsyncDisposable
                 "SteamKit did not provide the SteamUser handler.");
 
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(SteamClient.CancellationToken);
+        _cancellationToken = _cancellationTokenSource.Token;
     }
 
     public ValueTask DisposeAsync()
@@ -256,12 +260,6 @@ public class SteamContentClient : IAsyncDisposable
                     disposition = CdnServerDisposition.Abandoned;
                 }
 
-                Logger?.LogWarning(
-                    ex,
-                    "Manifest {ManifestId} of depot {DepotId} failed via {Host} on attempt {Attempt} ({Status}).",
-                    manifestId, depotId, server?.Host, attempts + 1,
-                    (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
-
                 // A CDN gets one authentication-recovery attempt per download sequence. Keep its lease
                 // checked out while retrying with the replacement token.
                 if (server is not null)
@@ -304,6 +302,24 @@ public class SteamContentClient : IAsyncDisposable
                         serverLeaseForAuthRetry = serverLease;
                         retainServerForRetry = true;
                     }
+                }
+
+                if (retainServerForRetry)
+                {
+                    // A 403 that is about to be retried once with a replacement token is expected to be
+                    // fixed by that retry, so it does not need a stack trace.
+                    Logger?.LogWarning(
+                        "HTTP 403 from CDN {Host} for manifest {ManifestId} of depot {DepotId}. " +
+                        "Attempt {Attempt} of {MaxAttempts}. Retrying same server once with replacement auth token.",
+                        server?.Host, manifestId, depotId, attempts + 1, maxAttempts);
+                }
+                else
+                {
+                    Logger?.LogWarning(
+                        ex,
+                        "Manifest {ManifestId} of depot {DepotId} failed via {Host} on attempt {Attempt} ({Status}).",
+                        manifestId, depotId, server?.Host, attempts + 1,
+                        (ex as SteamKit.SteamKitWebRequestException)?.StatusCode);
                 }
             }
             finally
@@ -470,7 +486,7 @@ public class SteamContentClient : IAsyncDisposable
             async tokenCancellationToken =>
             {
                 try
-			    {
+                {
                     var auth = await SteamClient._steamContentHandler
                         .GetCDNAuthToken(appId, depotId, host)
                         .WaitAsync(tokenCancellationToken)
@@ -518,7 +534,7 @@ public class SteamContentClient : IAsyncDisposable
                 }
             },
             cancellationToken).ConfigureAwait(false);
-	}
+    }
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
     {
@@ -881,56 +897,56 @@ public class SteamContentClient : IAsyncDisposable
             var languages = new List<string>();
             var configEntries = new Dictionary<string, string>();
 
-        foreach (var configEntry in depot["config"].Children)
-        {
-            var entryName = configEntry.Name;
-
-            if (string.IsNullOrEmpty(entryName))
+            foreach (var configEntry in depot["config"].Children)
             {
-                continue;
-            }
+                var entryName = configEntry.Name;
 
-            if (entryName == "oslist")
-            {
-                var value = configEntry.AsString();
-
-                if (!string.IsNullOrEmpty(value))
+                if (string.IsNullOrEmpty(entryName))
                 {
-                    operatingSystems.AddRange(
-                        value.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                            .Select(identifier => new SteamOs(identifier)));
+                    continue;
+                }
+
+                if (entryName == "oslist")
+                {
+                    var value = configEntry.AsString();
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        operatingSystems.AddRange(
+                            value.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(identifier => new SteamOs(identifier)));
+                    }
+                }
+                else if (entryName == "osarch")
+                {
+                    var value = configEntry.AsString();
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        processorArchitectures.AddRange(
+                            value.Split(',', StringSplitOptions.RemoveEmptyEntries));
+                    }
+                }
+                else if (entryName == "language")
+                {
+                    var value = configEntry.AsString();
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        languages.AddRange(
+                            value.Split(',', StringSplitOptions.RemoveEmptyEntries));
+                    }
+                }
+                else
+                {
+                    var value = configEntry.Value;
+
+                    if (value is not null)
+                    {
+                        configEntries[entryName] = value;
+                    }
                 }
             }
-            else if (entryName == "osarch")
-            {
-                var value = configEntry.AsString();
-
-                if (!string.IsNullOrEmpty(value))
-                {
-                    processorArchitectures.AddRange(
-                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
-                }
-            }
-            else if (entryName == "language")
-            {
-                var value = configEntry.AsString();
-
-                if (!string.IsNullOrEmpty(value))
-                {
-                    languages.AddRange(
-                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
-                }
-            }
-            else
-            {
-                var value = configEntry.Value;
-
-                if (value is not null)
-                {
-                    configEntries[entryName] = value;
-                }
-            }
-        }
 
             var manifests = depot["manifests"]
                 .Children
@@ -1138,11 +1154,31 @@ public class SteamContentClient : IAsyncDisposable
     [SuppressMessage("Security", "CA5358", Justification = "Same reason: AES-ECB is dictated by Steam.")]
     internal static DepotManifest DecryptManifestId(DepotEncryptedManifest manifest, byte[] key)
     {
+        // A malformed id says nothing about the password, so it is reported separately from a
+        // decryption failure. This has to sit outside the try below, which treats failures as a wrong password.
+        byte[] encryptedManifestIdBytes;
         try
         {
-            // Inside the try, so a malformed id is reported the same way as a wrong password
-            var encryptedManifestIdBytes = DecodeHexString(manifest.EncryptedManifestId);
+            var hex = manifest.EncryptedManifestId;
+            if (string.IsNullOrEmpty(hex) || hex.Length % 2 != 0)
+            {
+                throw new FormatException("it must be a non-empty hex string with an even number of characters.");
+            }
 
+            encryptedManifestIdBytes = DecodeHexString(hex);
+        }
+        catch (Exception ex) when (ex is FormatException or ArgumentException or OverflowException)
+        {
+            throw new SteamInvalidBranchPasswordException(
+                manifest.AppId,
+                manifest.DepotId,
+                manifest.BranchName,
+                ex.Message,
+                ex);
+        }
+
+        try
+        {
             using var aes = Aes.Create();
             aes.BlockSize = 128;
             aes.KeySize = 256;
@@ -1197,27 +1233,24 @@ public class SteamContentClient : IAsyncDisposable
         }
 
         var manifest = depot.Manifests.FirstOrDefault();
-        var encryptedManifest = depot.EncryptedManifests.FirstOrDefault();
 
         if (manifest != null)
         {
             return manifest.ManifestId;
         }
 
-        if (encryptedManifest != null)
+        // GetDepotsAsync drops depots that have no manifest at all for the requested branch,
+        // so a depot without a plain manifest here always has an encrypted one.
+        var encryptedManifest = depot.EncryptedManifests.First();
+
+        if (branchPassword == null)
         {
-            if (branchPassword == null)
-            {
-                throw new SteamInvalidBranchPasswordException(appId, depotId, branch);
-            }
-
-            manifest = await DecryptDepotManifestAsync(encryptedManifest, branchPassword);
-
-            return manifest.ManifestId;
+            throw new SteamInvalidBranchPasswordException(appId, depotId, branch);
         }
 
-        throw new ArgumentException(
-            $"Combination of app id = {appId}, depot id = {depotId} and branch = {branch} could not be found.");
+        manifest = await DecryptDepotManifestAsync(encryptedManifest, branchPassword);
+
+        return manifest.ManifestId;
     }
 
     internal async Task<IDownloadHandler> GetAppDataInternalAsync(
