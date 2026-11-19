@@ -342,7 +342,7 @@ public class SteamContentClient : IAsyncDisposable
 
     // Gets the current pool for the app and admits an operation on it. If the pool was being
     // replaced between those two steps, ask for the current one again.
-    private async Task<(SteamCdnServerPool Pool, CdnOperationLease Lease)> BeginPoolOperationAsync(
+    internal async Task<(SteamCdnServerPool Pool, CdnOperationLease Lease)> BeginPoolOperationAsync(
         AppId appId,
         CancellationToken cancellationToken)
     {
@@ -357,7 +357,7 @@ public class SteamContentClient : IAsyncDisposable
         }
     }
 
-    private async Task<SteamCdnServerPool> GetSteamCdnServerPoolAsync(
+    internal async Task<SteamCdnServerPool> GetSteamCdnServerPoolAsync(
         AppId appId,
         CancellationToken cancellationToken = default)
     {
