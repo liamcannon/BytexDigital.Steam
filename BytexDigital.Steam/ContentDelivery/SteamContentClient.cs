@@ -486,7 +486,7 @@ public class SteamContentClient : IAsyncDisposable
             async tokenCancellationToken =>
             {
                 try
-			    {
+                {
                     var auth = await SteamClient._steamContentHandler
                         .GetCDNAuthToken(appId, depotId, host)
                         .WaitAsync(tokenCancellationToken)
@@ -534,7 +534,7 @@ public class SteamContentClient : IAsyncDisposable
                 }
             },
             cancellationToken).ConfigureAwait(false);
-	}
+    }
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
     {
@@ -897,56 +897,56 @@ public class SteamContentClient : IAsyncDisposable
             var languages = new List<string>();
             var configEntries = new Dictionary<string, string>();
 
-        foreach (var configEntry in depot["config"].Children)
-        {
-            var entryName = configEntry.Name;
-
-            if (string.IsNullOrEmpty(entryName))
+            foreach (var configEntry in depot["config"].Children)
             {
-                continue;
-            }
+                var entryName = configEntry.Name;
 
-            if (entryName == "oslist")
-            {
-                var value = configEntry.AsString();
-
-                if (!string.IsNullOrEmpty(value))
+                if (string.IsNullOrEmpty(entryName))
                 {
-                    operatingSystems.AddRange(
-                        value.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                            .Select(identifier => new SteamOs(identifier)));
+                    continue;
+                }
+
+                if (entryName == "oslist")
+                {
+                    var value = configEntry.AsString();
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        operatingSystems.AddRange(
+                            value.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                .Select(identifier => new SteamOs(identifier)));
+                    }
+                }
+                else if (entryName == "osarch")
+                {
+                    var value = configEntry.AsString();
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        processorArchitectures.AddRange(
+                            value.Split(',', StringSplitOptions.RemoveEmptyEntries));
+                    }
+                }
+                else if (entryName == "language")
+                {
+                    var value = configEntry.AsString();
+
+                    if (!string.IsNullOrEmpty(value))
+                    {
+                        languages.AddRange(
+                            value.Split(',', StringSplitOptions.RemoveEmptyEntries));
+                    }
+                }
+                else
+                {
+                    var value = configEntry.Value;
+
+                    if (value is not null)
+                    {
+                        configEntries[entryName] = value;
+                    }
                 }
             }
-            else if (entryName == "osarch")
-            {
-                var value = configEntry.AsString();
-
-                if (!string.IsNullOrEmpty(value))
-                {
-                    processorArchitectures.AddRange(
-                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
-                }
-            }
-            else if (entryName == "language")
-            {
-                var value = configEntry.AsString();
-
-                if (!string.IsNullOrEmpty(value))
-                {
-                    languages.AddRange(
-                        value.Split(',', StringSplitOptions.RemoveEmptyEntries));
-                }
-            }
-            else
-            {
-                var value = configEntry.Value;
-
-                if (value is not null)
-                {
-                    configEntries[entryName] = value;
-                }
-            }
-        }
 
             var manifests = depot["manifests"]
                 .Children

@@ -32,7 +32,7 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             if (fileStream == null)
             {
-			    fileStream = new FileStream(
+                fileStream = new FileStream(
                     _filePath,
                     FileMode.Create,
                     FileAccess.Write,
@@ -44,9 +44,9 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                 fileStream.SetLength((long)_fileSize);
             }
 
-        fileStream.Seek((long)offset, SeekOrigin.Begin);
-        await fileStream.WriteAsync(data.AsMemory()).ConfigureAwait(false);
-    }
+            fileStream.Seek((long)offset, SeekOrigin.Begin);
+            await fileStream.WriteAsync(data.AsMemory()).ConfigureAwait(false);
+        }
 
         public override async Task CancelAsync()
         {
