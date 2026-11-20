@@ -58,6 +58,9 @@ public class SteamContentClient : IAsyncDisposable
 
     public ILogger? Logger { get; set; }
 
+    // Lets tests supply pools that do not talk to Steam. Not set in normal use.
+    internal Func<AppId, SteamCdnServerPool>? CdnPoolFactory { get; set; }
+
     internal SteamKit.Internal.PublishedFile PublishedFileService { get; }
     internal SteamKit.SteamUser SteamUser { get; }
     internal SteamKit.SteamApps SteamApps { get; }
@@ -379,7 +382,8 @@ public class SteamContentClient : IAsyncDisposable
                 replacedPool = existingPool;
             }
 
-            serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
+            serverPool = CdnPoolFactory?.Invoke(appId)
+                        ?? new SteamCdnServerPool(this, appId) { Logger = Logger };
             _serverPools[appId] = serverPool;
         }
 
