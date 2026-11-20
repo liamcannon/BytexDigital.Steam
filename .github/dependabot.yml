@@ -12,11 +12,11 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "chore(actions)"
-    groups:
-      actions-minor-patch:
+    ignore:
+      - dependency-name: "*"
         update-types:
-          - "patch"
-          - "minor"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
 
   # NuGet packages
   - package-ecosystem: "nuget"
@@ -29,8 +29,8 @@ updates:
       - "dependencies"
     commit-message:
       prefix: "chore(nuget)"
-    groups:
-      nuget-minor-patch:
+    ignore:
+      - dependency-name: "*"
         update-types:
-          - "patch"
-          - "minor"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
