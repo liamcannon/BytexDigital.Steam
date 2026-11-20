@@ -29,7 +29,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             new ConcurrentDictionary<ManifestFile, FileTarget>();
 
         private ConcurrentBag<FileWriter>? _fileWriters = new ConcurrentBag<FileWriter>();
-        private SteamCdnServerPool? _serverPool;
         private ConcurrentBag<ChunkJob> _chunks = new ConcurrentBag<ChunkJob>();
         internal SteamContentClient? _steamContentClient;
 
@@ -252,15 +251,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                     "Depot {DepotId}: downloading {Files} files in {Chunks} chunks ({Size} bytes).",
                     DepotId, FileWriters.Count, _chunks.Count, TotalFileSize);
 
-                Logger?.LogTrace("Creating Steam CDN server pool");
-
-                _serverPool = new SteamCdnServerPool(ContentClient, AppId, cancellationToken)
-                {
-                    Logger = Logger
-                };
-
-                Logger?.LogTrace("Created Steam CDN server pool");
-
                 Logger?.LogTrace("Fetching depot key");
 
                 // Get the depot key with which we will process all chunks downloaded
@@ -313,25 +303,12 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             }
             finally
             {
-                try
+                if (FileWriters.Count > 0)
                 {
-                    if (FileWriters.Count > 0)
-                    {
-                        Logger?.LogTrace("Disposing all file writers");
+                    Logger?.LogTrace("Disposing all file writers");
 
-                        await Task.WhenAll(
-                            FileWriters.Select(x => x.DisposeAsync().AsTask()));
-                    }
-                }
-                finally
-                {
-                    Logger?.LogTrace("Closing server pool");
-
-                    if (_serverPool != null)
-                    {
-                        await _serverPool.DisposeAsync().ConfigureAwait(false);
-                        _serverPool = null;
-                    }
+                    await Task.WhenAll(
+                        FileWriters.Select(x => x.DisposeAsync().AsTask()));
                 }
             }
 
@@ -426,9 +403,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
         private async Task DownloadChunkAsync(ChunkJob chunkJob, CancellationToken cancellationToken)
         {
             const int maxAttempts = 5;
-            var serverPool = _serverPool
-                ?? throw new InvalidOperationException(
-                    "The CDN server pool has not been initialized or is no longer available.");
 
             var depotKey = _depotKey
                 ?? throw new InvalidOperationException(
@@ -436,8 +410,11 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
             var downloadedData = new byte[chunkJob.InternalChunk.UncompressedLength];
             var writtenBytes = 0;
-            // Held across every attempt, including auth recovery retries.
-            using var operationLease = serverPool.BeginCdnOperation();
+            // Look up the client's current pool for this app and admit this chunk on it. The lease is held
+            // across every attempt, including auth recovery retries. A pool that was replaced since the last
+            // chunk is picked up here, so no pool is held across chunks.
+            var (serverPool, operationLease) = await ContentClient.BeginPoolOperationAsync(AppId, cancellationToken);
+            using var leaseScope = operationLease;
 
             CdnServerLease? serverLeaseForAuthRetry = null;
             var recoveryProbeAttempted = false;
@@ -673,21 +650,6 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
             _fileTargets = null;
             _fileWriters = null;
             _steamContentClient = null;
-
-            // Dispose the server pool
-            try
-            {
-                if (_serverPool != null)
-                {
-                    await _serverPool.DisposeAsync().ConfigureAwait(false);
-                }
-            }
-            catch
-            {
-                // ignored
-            }
-
-            _serverPool = null;
         }
 
         public void Dispose()
