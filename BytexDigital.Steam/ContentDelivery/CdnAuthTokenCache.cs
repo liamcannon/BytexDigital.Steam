@@ -8,12 +8,22 @@ namespace BytexDigital.Steam.ContentDelivery;
 internal sealed class CdnAuthTokenCache
 {
     private static readonly TimeSpan ExpirySafetyWindow =
-        TimeSpan.FromMinutes(1);
+    TimeSpan.FromMinutes(1);
+
+    private static readonly TimeSpan InitialRefreshFailureBackoff =
+        TimeSpan.FromSeconds(5);
+
+    private static readonly TimeSpan MaximumRefreshFailureBackoff =
+        TimeSpan.FromSeconds(60);
 
     private readonly ConcurrentDictionary<string, Entry> _tokens = new();
 
-    // One lock per key (depot + host), so a slow request for one CDN never holds up another
+    // One lock per key (depot + host), so a slow request for one CDN never holds up another.
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _refreshLocks = new();
+
+    // Tracks failed refresh attempts independently for each depot and host.
+    private readonly ConcurrentDictionary<string, RefreshFailure> _refreshFailures = new();
+
     private readonly Func<DateTime> _utcNow;
 
     internal CdnAuthTokenCache(Func<DateTime>? utcNow = null)
@@ -94,18 +104,27 @@ internal sealed class CdnAuthTokenCache
         {
             if (_tokens.TryGetValue(key, out var existing))
             {
-                // Another worker may already have refreshed the rejected token.
+                // An empty token is still a successful response from Steam.
+                // Keep it cached until expiration rather than requesting it again.
                 if (IsUsable(existing) &&
+                (string.IsNullOrWhiteSpace(existing.Token) ||
                     !string.Equals(
                         existing.Token,
                         rejectedToken,
-                        StringComparison.Ordinal))
+                        StringComparison.Ordinal)))
                 {
                     return true;
                 }
 
                 // Remove an expired token or the token that was rejected.
                 _tokens.TryRemove(key, out _);
+            }
+
+            // Do not repeatedly contact Steam while this depot/host is in its failure cooldown.
+            if (_refreshFailures.TryGetValue(key, out var refreshFailure) &&
+                _utcNow() < refreshFailure.RetryAfter)
+            {
+                return false;
             }
 
             Entry? replacement;
@@ -121,24 +140,37 @@ internal sealed class CdnAuthTokenCache
             }
             catch
             {
-                // Refresh failed; the caller can try another server.
+                // Refresh failed; apply backoff before requesting another token.
+                RecordRefreshFailure(key);
                 return false;
             }
 
-            // Never retry with a missing, expired, nearly expired,
-            // or unchanged replacement token.
-            if (replacement is null ||
-                string.IsNullOrWhiteSpace(replacement.Token) ||
-                !IsUsable(replacement) ||
+            // An empty token is a valid cached response from Steam.
+            // A non-empty replacement must still differ from the rejected token.
+            if (replacement is null)
+            {
+                RecordRefreshFailure(key);
+                return false;
+            }
+
+            replacement = replacement with
+            {
+                Token = replacement.Token ?? string.Empty
+            };
+
+            if (!IsUsable(replacement) ||
+                (!string.IsNullOrWhiteSpace(replacement.Token) &&
                 string.Equals(
                     replacement.Token,
                     rejectedToken,
-                    StringComparison.Ordinal))
+                    StringComparison.Ordinal)))
             {
+                RecordRefreshFailure(key);
                 return false;
             }
 
             _tokens[key] = replacement;
+            _refreshFailures.TryRemove(key, out _);
             return true;
         }
         finally
@@ -149,9 +181,49 @@ internal sealed class CdnAuthTokenCache
 
     private bool IsUsable(Entry entry)
     {
-        return !string.IsNullOrWhiteSpace(entry.Token) &&
-               entry.Expiration > _utcNow().Add(ExpirySafetyWindow);
+        return entry.Expiration > _utcNow().Add(ExpirySafetyWindow);
     }
 
+    private void RecordRefreshFailure(string key)
+    {
+        var now = _utcNow();
+
+        _refreshFailures.AddOrUpdate(
+            key,
+            _ => new RefreshFailure(
+                1,
+                now.Add(InitialRefreshFailureBackoff)),
+            (_, previous) =>
+            {
+                var failureCount = Math.Min(
+                    previous.ConsecutiveFailures + 1,
+                    5);
+
+                return new RefreshFailure(
+                    failureCount,
+                    now.Add(GetRefreshFailureBackoff(failureCount)));
+            });
+    }
+
+    private static TimeSpan GetRefreshFailureBackoff(int consecutiveFailures)
+    {
+        var delay = InitialRefreshFailureBackoff;
+
+        for (var attempt = 1;
+            attempt < consecutiveFailures && delay < MaximumRefreshFailureBackoff;
+            attempt++)
+        {
+            delay = delay.Ticks > MaximumRefreshFailureBackoff.Ticks / 2
+                ? MaximumRefreshFailureBackoff
+                : TimeSpan.FromTicks(delay.Ticks * 2);
+        }
+
+        return delay;
+    }
+
+    private sealed record RefreshFailure(
+        int ConsecutiveFailures,
+        DateTime RetryAfter);
+
     internal sealed record Entry(string? Token, DateTime Expiration);
-}
+    }

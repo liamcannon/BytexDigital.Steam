@@ -241,6 +241,118 @@ public class CdnAuthTokenCacheTests
     }
 
     [Fact]
+    public async Task RefreshAsync_WhenManyWorkersFailTogether_RequestsOnlyOnceDuringBackoff()
+    {
+        var cache = new CdnAuthTokenCache(() => Start);
+
+        var fetcher = new Fetcher
+        {
+            Failure = new InvalidOperationException("Token request failed."),
+            Delay = TimeSpan.FromMilliseconds(20)
+        };
+
+        var results = await Task.WhenAll(
+            Enumerable.Range(0, 20)
+                .Select(_ => cache.RefreshAsync(
+                    Key,
+                    null,
+                    fetcher.FetchAsync,
+                    CancellationToken.None)));
+
+        Assert.All(results, result => Assert.False(result));
+        Assert.Equal(1, fetcher.Calls);
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenFailureCooldownExpires_AllowsAnotherRequest()
+    {
+        var now = Start;
+        var cache = new CdnAuthTokenCache(() => now);
+
+        var fetcher = new Fetcher
+        {
+            Failure = new InvalidOperationException("Temporary failure.")
+        };
+
+        var first = await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None);
+
+        Assert.False(first);
+        Assert.Equal(1, fetcher.Calls);
+
+        fetcher.Failure = null;
+        fetcher.Result = Token("recovered-token");
+
+        // Still inside the five-second cooldown.
+        var blocked = await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None);
+
+        Assert.False(blocked);
+        Assert.Equal(1, fetcher.Calls);
+
+        now = now.AddSeconds(5);
+
+        var recovered = await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None);
+
+        Assert.True(recovered);
+        Assert.Equal(2, fetcher.Calls);
+        Assert.Equal("recovered-token", cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_RepeatedFailures_ApplyIncreasingBackoff()
+    {
+        var now = Start;
+        var cache = new CdnAuthTokenCache(() => now);
+
+        var fetcher = new Fetcher
+        {
+            Failure = new InvalidOperationException("Temporary failure.")
+        };
+
+        // First failure: five seconds.
+        Assert.False(await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None));
+
+        now = now.AddSeconds(5);
+
+        // Second failure: ten seconds.
+        Assert.False(await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None));
+
+        now = now.AddSeconds(9);
+
+        Assert.False(await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None));
+
+        Assert.Equal(2, fetcher.Calls);
+
+        now = now.AddSeconds(1);
+
+        // Third failure: twenty seconds.
+        Assert.False(await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None));
+
+        Assert.Equal(3, fetcher.Calls);
+
+        now = now.AddSeconds(19);
+
+        Assert.False(await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None));
+
+        Assert.Equal(3, fetcher.Calls);
+
+        now = now.AddSeconds(1);
+
+        // Fourth attempt is now permitted.
+        Assert.False(await cache.RefreshAsync(
+            Key, null, fetcher.FetchAsync, CancellationToken.None));
+
+        Assert.Equal(4, fetcher.Calls);
+    }
+
+    [Fact]
     public async Task Tokens_AreKeptSeparateByKey()
     {
         var cache = new CdnAuthTokenCache(() => Start);
@@ -297,7 +409,7 @@ public class CdnAuthTokenCacheTests
         Assert.Equal("newer-token", cache.GetToken(Key));
     }
 
-        [Fact]
+    [Fact]
     public async Task RefreshAsync_DifferentKeysDoNotWaitForEachOther()
     {
         var cache = new CdnAuthTokenCache(() => Start);
@@ -324,5 +436,100 @@ public class CdnAuthTokenCacheTests
 
         Assert.True(await slow);
         Assert.Equal("slow-token", cache.GetToken("233781:slow.example.com"));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenProviderReturnsEmptyToken_CachesSuccessfulResponse()
+    {
+        var cache = new CdnAuthTokenCache(() => Start);
+        var fetcher = new Fetcher { Result = Token(string.Empty) };
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            null,
+            fetcher.FetchAsync,
+            CancellationToken.None);
+
+        Assert.True(refreshed);
+        Assert.Equal(1, fetcher.Calls);
+        Assert.Equal(string.Empty, cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenEmptyTokenIsCached_DoesNotRequestAgain()
+    {
+        var cache = new CdnAuthTokenCache(() => Start);
+        var fetcher = new Fetcher { Result = Token(string.Empty) };
+
+        await cache.RefreshAsync(
+            Key,
+            null,
+            fetcher.FetchAsync,
+            CancellationToken.None);
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            string.Empty,
+            fetcher.FetchAsync,
+            CancellationToken.None);
+
+        Assert.True(refreshed);
+        Assert.Equal(1, fetcher.Calls);
+        Assert.Equal(string.Empty, cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenEmptyTokenExpires_RequestsReplacement()
+    {
+        var now = Start;
+        var cache = new CdnAuthTokenCache(() => now);
+
+        var fetcher = new Fetcher
+        {
+            Result = Token(string.Empty, Start.AddHours(1))
+        };
+
+        await cache.RefreshAsync(
+            Key,
+            null,
+            fetcher.FetchAsync,
+            CancellationToken.None);
+
+        now = Start.AddHours(2);
+        fetcher.Result = Token("replacement-token", now.AddHours(1));
+
+        var refreshed = await cache.RefreshAsync(
+            Key,
+            null,
+            fetcher.FetchAsync,
+            CancellationToken.None);
+
+        Assert.True(refreshed);
+        Assert.Equal(2, fetcher.Calls);
+        Assert.Equal("replacement-token", cache.GetToken(Key));
+    }
+
+    [Fact]
+    public async Task RefreshAsync_WhenManyWorkersRequestEmptyToken_RequestsOnlyOnce()
+    {
+        var cache = new CdnAuthTokenCache(() => Start);
+
+        var fetcher = new Fetcher
+        {
+            Result = Token(string.Empty),
+            Delay = TimeSpan.FromMilliseconds(20)
+        };
+
+        var results = await Task.WhenAll(
+            Enumerable.Range(0, 20)
+                .Select(_ => cache.RefreshAsync(
+                    Key,
+                    null,
+                    fetcher.FetchAsync,
+                    CancellationToken.None)));
+
+        Assert.All(results, result => Assert.True(result));
+        Assert.Equal(1, fetcher.Calls);
+        Assert.Equal(string.Empty, cache.GetToken(Key));
     }
 }
