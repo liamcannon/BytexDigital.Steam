@@ -55,7 +55,7 @@ namespace BytexDigital.Steam.ContentDelivery
         public ILogger? Logger { get; set; }
         public Client CdnClient { get; }
         public Server? DesignatedProxyServer { get; private set; }
-        public bool IsExhausted { get; private set; }
+        public bool IsExhausted { get; internal set; }
         internal bool IsInExhaustionFallback => Volatile.Read(ref _exhaustionFallback) != 0;
 
         public SteamCdnServerPool(

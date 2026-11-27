@@ -119,6 +119,81 @@ public class SteamContentClientTests
             () => fixture.Client.GetSteamCdnServerPoolAsync(App));
     }
 
+    [Fact]
+    public async Task AnExhaustedPoolIsReplacedAndTheOldOneIsDisposed()
+    {
+        await using var fixture = new ClientFixture();
+
+        var first = await fixture.Client.GetSteamCdnServerPoolAsync(App);
+        first.IsExhausted = true;
+
+        var second = await fixture.Client.GetSteamCdnServerPoolAsync(App);
+
+        Assert.NotSame(first, second);
+        Assert.Equal(2, fixture.PoolsCreated);
+
+        // The old pool is disposed in the background, so wait for it to start
+        await WaitUntilAsync(() => DisposalHasStarted(first));
+
+        // Later lookups keep returning the replacement
+        Assert.Same(second, await fixture.Client.GetSteamCdnServerPoolAsync(App));
+    }
+
+    [Fact]
+    public async Task ReplacingAPoolDoesNotHoldTheLookupLockWhileItDisposes()
+    {
+        await using var fixture = new ClientFixture();
+
+        var first = await fixture.Client.GetSteamCdnServerPoolAsync(App);
+
+        // An admitted operation keeps the old pool's disposal waiting
+        using var lease = first.BeginCdnOperation();
+        first.IsExhausted = true;
+
+        // If the lookup waited for the old pool to finish disposing, this would time out
+        var second = await fixture.Client.GetSteamCdnServerPoolAsync(App)
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        // A lookup for a different app must not wait either
+        var other = await fixture.Client.GetSteamCdnServerPoolAsync(new AppId(107410))
+            .WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.NotSame(first, second);
+        Assert.NotNull(other);
+
+        // The old pool's disposal is still waiting for its admitted operation
+        Assert.False(first.DisposeAsync().AsTask().IsCompleted);
+
+        lease.Dispose();
+
+        await first.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    private static bool DisposalHasStarted(SteamCdnServerPool pool)
+    {
+        try
+        {
+            // Admitting an operation fails once disposal has started. Release it straight away if it works.
+            pool.BeginCdnOperation().Dispose();
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "The condition was not met within 5 seconds.");
+            await Task.Delay(10);
+        }
+    }
+
     private sealed class ClientFixture : IAsyncDisposable
     {
         private readonly SteamClient _steamClient = new(
