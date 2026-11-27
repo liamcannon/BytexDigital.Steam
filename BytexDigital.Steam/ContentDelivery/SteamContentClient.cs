@@ -58,6 +58,9 @@ public class SteamContentClient : IAsyncDisposable
 
     public ILogger? Logger { get; set; }
 
+    // Lets tests supply pools that do not talk to Steam. Not set in normal use.
+    internal Func<AppId, SteamCdnServerPool>? CdnPoolFactory { get; set; }
+
     internal SteamKit.Internal.PublishedFile PublishedFileService { get; }
     internal SteamKit.SteamUser SteamUser { get; }
     internal SteamKit.SteamApps SteamApps { get; }
@@ -342,7 +345,7 @@ public class SteamContentClient : IAsyncDisposable
 
     // Gets the current pool for the app and admits an operation on it. If the pool was being
     // replaced between those two steps, ask for the current one again.
-    private async Task<(SteamCdnServerPool Pool, CdnOperationLease Lease)> BeginPoolOperationAsync(
+    internal async Task<(SteamCdnServerPool Pool, CdnOperationLease Lease)> BeginPoolOperationAsync(
         AppId appId,
         CancellationToken cancellationToken)
     {
@@ -357,29 +360,49 @@ public class SteamContentClient : IAsyncDisposable
         }
     }
 
-    private async Task<SteamCdnServerPool> GetSteamCdnServerPoolAsync(
+    internal async Task<SteamCdnServerPool> GetSteamCdnServerPoolAsync(
         AppId appId,
         CancellationToken cancellationToken = default)
     {
-        using var lk = await _serverPoolsLock.LockAsync(cancellationToken);
+        SteamCdnServerPool serverPool;
+        SteamCdnServerPool? replacedPool = null;
 
-        ObjectDisposedException.ThrowIf(_disposeStarted, this);
-
-        if (_serverPools.TryGetValue(appId, out var serverPool))
+        using (await _serverPoolsLock.LockAsync(cancellationToken))
         {
-            if (!serverPool.IsExhausted)
+            ObjectDisposedException.ThrowIf(_disposeStarted, this);
+
+            if (_serverPools.TryGetValue(appId, out var existingPool))
             {
-                return serverPool;
+                if (!existingPool.IsExhausted)
+                {
+                    return existingPool;
+                }
+
+                // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
+                replacedPool = existingPool;
             }
 
-            // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
-            await serverPool.DisposeAsync().ConfigureAwait(false);
+            serverPool = CdnPoolFactory?.Invoke(appId)
+                        ?? new SteamCdnServerPool(this, appId) { Logger = Logger };
+            _serverPools[appId] = serverPool;
         }
 
-        serverPool = new SteamCdnServerPool(this, appId) { Logger = Logger };
-        _serverPools[appId] = serverPool;
+        if (replacedPool != null)
+        {
+            // Disposal waits for work admitted on the old pool. That must never happen while holding the
+            // lock, because every other lookup, for any app, would wait behind it.
+            _ = DisposeReplacedPoolAsync(replacedPool);
+        }
 
         return serverPool;
+    }
+
+    private async Task DisposeReplacedPoolAsync(SteamCdnServerPool pool)
+    {
+        try
+        { await pool.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception ex)
+        { Logger?.LogWarning(ex, "Disposing a replaced CDN server pool failed."); }
     }
 
     private static string CdnKey(DepotId depotId, string host) =>
