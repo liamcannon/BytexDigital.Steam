@@ -8,7 +8,7 @@ internal enum CdnAuthRecoveryAction
 {
     None,
     RetrySameServer,
-    DropServer
+    ExcludeServerForOperation
 }
 
 internal static class CdnAuthRecoveryPolicy
@@ -40,15 +40,47 @@ internal static class CdnAuthRecoveryPolicy
             await invalidateRejectedTokenAsync(cancellationToken)
                 .ConfigureAwait(false);
 
-            return CdnAuthRecoveryAction.DropServer;
+            return CdnAuthRecoveryAction.ExcludeServerForOperation;
         }
 
         // A usable cached replacement token also counts as success here.
-        var refreshed = await refreshTokenAsync(cancellationToken)
-            .ConfigureAwait(false);
+        // A refresh exception is an authentication-recovery failure, not
+        // evidence that the CDN host itself is unhealthy.
+        try
+        {
+            var refreshed = await refreshTokenAsync(cancellationToken)
+                .ConfigureAwait(false);
 
-        return refreshed
-            ? CdnAuthRecoveryAction.RetrySameServer
-            : CdnAuthRecoveryAction.DropServer;
+            return refreshed
+                ? CdnAuthRecoveryAction.RetrySameServer
+                : CdnAuthRecoveryAction.ExcludeServerForOperation;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return CdnAuthRecoveryAction.ExcludeServerForOperation;
+        }
+    }
+
+    internal static CdnServerDisposition ApplyRecoveryDisposition(
+        CdnServerDisposition currentDisposition,
+        bool isForbidden,
+        CdnAuthRecoveryAction recoveryAction,
+        Action excludeServerForOperation)
+    {
+        ArgumentNullException.ThrowIfNull(excludeServerForOperation);
+
+        if (isForbidden &&
+            recoveryAction == CdnAuthRecoveryAction.ExcludeServerForOperation)
+        {
+            excludeServerForOperation();
+
+            return CdnServerDisposition.Abandoned;
+        }
+
+        return currentDisposition;
     }
 }

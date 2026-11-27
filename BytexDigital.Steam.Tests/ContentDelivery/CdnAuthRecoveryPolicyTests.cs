@@ -37,7 +37,7 @@ public class CdnAuthRecoveryPolicyTests
     }
 
     [Fact]
-    public async Task SecondCdn403_InvalidatesTokenAndDropsServer()
+    public async Task SecondCdn403_InvalidatesTokenAndExcludesServerForOperation()
     {
         var refreshCalls = 0;
         var invalidateCalls = 0;
@@ -59,13 +59,13 @@ public class CdnAuthRecoveryPolicyTests
             },
             cancellationToken: CancellationToken.None);
 
-        Assert.Equal(CdnAuthRecoveryAction.DropServer, action);
+        Assert.Equal(CdnAuthRecoveryAction.ExcludeServerForOperation, action);
         Assert.Equal(0, refreshCalls);
         Assert.Equal(1, invalidateCalls);
     }
 
     [Fact]
-    public async Task RefreshFails_DropsServer()
+    public async Task RefreshFails_ExcludesServerForOperation()
     {
         var action = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
             true,
@@ -76,7 +76,7 @@ public class CdnAuthRecoveryPolicyTests
             _ => Task.CompletedTask,
             CancellationToken.None);
 
-        Assert.Equal(CdnAuthRecoveryAction.DropServer, action);
+        Assert.Equal(CdnAuthRecoveryAction.ExcludeServerForOperation, action);
     }
 
     [Fact]
@@ -97,7 +97,7 @@ public class CdnAuthRecoveryPolicyTests
             _ => Task.CompletedTask,
             CancellationToken.None);
 
-        Assert.Equal(CdnAuthRecoveryAction.DropServer, action);
+        Assert.Equal(CdnAuthRecoveryAction.ExcludeServerForOperation, action);
         Assert.Equal(0, refreshCalls);
     }
 
@@ -148,6 +148,32 @@ public class CdnAuthRecoveryPolicyTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => action);
+    }
+
+    [Fact]
+    public async Task RefreshThrows_ExcludesServerForOperation()
+    {
+        var invalidateCalls = 0;
+
+        var action = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
+            isCdnServer: true,
+            isForbidden: true,
+            retryingWithReplacementToken: false,
+            canRetry: true,
+            refreshTokenAsync: _ => Task.FromException<bool>(
+                new InvalidOperationException("Steam token service unavailable.")),
+            invalidateRejectedTokenAsync: _ =>
+            {
+                invalidateCalls++;
+                return Task.CompletedTask;
+            },
+            cancellationToken: CancellationToken.None);
+
+        Assert.Equal(
+            CdnAuthRecoveryAction.ExcludeServerForOperation,
+            action);
+
+        Assert.Equal(0, invalidateCalls);
     }
 
     [Fact]
@@ -226,7 +252,7 @@ public class CdnAuthRecoveryPolicyTests
                     key, "replacement-token", ct),
             cancellationToken: CancellationToken.None);
 
-        Assert.Equal(CdnAuthRecoveryAction.DropServer, action);
+        Assert.Equal(CdnAuthRecoveryAction.ExcludeServerForOperation, action);
         Assert.Null(cache.GetToken(key));
     }
 
@@ -264,7 +290,7 @@ public class CdnAuthRecoveryPolicyTests
                     key, "replacement-v1", ct),
             cancellationToken: CancellationToken.None);
 
-        Assert.Equal(CdnAuthRecoveryAction.DropServer, action);
+        Assert.Equal(CdnAuthRecoveryAction.ExcludeServerForOperation, action);
         Assert.Equal("replacement-v2", cache.GetToken(key));
     }
 
@@ -291,7 +317,7 @@ public class CdnAuthRecoveryPolicyTests
             },
             cancellationToken: CancellationToken.None);
 
-        Assert.Equal(CdnAuthRecoveryAction.DropServer, action);
+        Assert.Equal(CdnAuthRecoveryAction.ExcludeServerForOperation, action);
         Assert.Equal(0, refreshCalls);
         Assert.Equal(1, invalidateCalls);
     }
@@ -337,5 +363,35 @@ public class CdnAuthRecoveryPolicyTests
         Assert.Equal(1, tokenRequests);
         Assert.Equal(0, invalidationCalls);
         Assert.Equal("replacement-token", cache.GetToken(key));
+    }
+
+    [Fact]
+    public void TerminalCdn403_ExcludesServerAndReturnsAbandoned()
+    {
+        var excludeCalls = 0;
+
+        var disposition = CdnAuthRecoveryPolicy.ApplyRecoveryDisposition(
+            CdnServerDisposition.Failed,
+            isForbidden: true,
+            recoveryAction: CdnAuthRecoveryAction.ExcludeServerForOperation,
+            excludeServerForOperation: () => excludeCalls++);
+
+        Assert.Equal(CdnServerDisposition.Abandoned, disposition);
+        Assert.Equal(1, excludeCalls);
+    }
+
+    [Fact]
+    public void GenuineServerFailure_PreservesFailedDisposition()
+    {
+        var excludeCalls = 0;
+
+        var disposition = CdnAuthRecoveryPolicy.ApplyRecoveryDisposition(
+            CdnServerDisposition.Failed,
+            isForbidden: false,
+            recoveryAction: CdnAuthRecoveryAction.None,
+            excludeServerForOperation: () => excludeCalls++);
+
+        Assert.Equal(CdnServerDisposition.Failed, disposition);
+        Assert.Equal(0, excludeCalls);
     }
 }

@@ -437,7 +437,8 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
 
                     serverLease ??= serverPool.GetServerForDownload(
                         cancellationToken,
-                        allowRecoveryProbe: !recoveryProbeAttempted);
+                        allowRecoveryProbe: !recoveryProbeAttempted,
+                        operationLease: operationLease);
                     server = serverLease.Value.Server;
 
                     if (serverLease.Value.RecoveryProbe.HasValue)
@@ -542,13 +543,21 @@ namespace BytexDigital.Steam.ContentDelivery.Models.Downloading
                             serverLeaseForAuthRetry = serverLease;
                             retainServerForRetry = true;
                         }
+                        else
+                        {
+                            disposition = CdnAuthRecoveryPolicy.ApplyRecoveryDisposition(
+                                disposition,
+                                forbidden,
+                                recoveryAction,
+                                () => operationLease.ExcludeServer(server));
+                        }
 
                         var recoveryOutcome = recoveryAction switch
                         {
                             CdnAuthRecoveryAction.RetrySameServer =>
                                 "Retrying same server once with replacement auth token",
-                            CdnAuthRecoveryAction.DropServer =>
-                                "Dropping server; will try another eligible server if attempts remain",
+                            CdnAuthRecoveryAction.ExcludeServerForOperation =>
+                                "Excluding CDN host for this download; shared server health unchanged",
                             _ =>
                                 "No CDN auth recovery"
                         };

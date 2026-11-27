@@ -188,7 +188,8 @@ public class SteamContentClient : IAsyncDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 serverLease ??= pool.GetServerForDownload(
                     cancellationToken,
-                    allowRecoveryProbe: !recoveryProbeAttempted);
+                    allowRecoveryProbe: !recoveryProbeAttempted,
+                    operationLease: operationLease);
                 server = serverLease.Value.Server;
 
                 if (serverLease.Value.RecoveryProbe.HasValue)
@@ -277,12 +278,15 @@ public class SteamContentClient : IAsyncDisposable
                 {
                     CdnAuthRecoveryAction recoveryAction;
 
+                    var forbidden = server.Type == "CDN" &&
+                        ex is SteamKit.SteamKitWebRequestException
+                            { StatusCode: HttpStatusCode.Forbidden };
+
                     try
                     {
                         recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
                             isCdnServer: server.Type == "CDN",
-                            isForbidden: ex is SteamKit.SteamKitWebRequestException
-                                { StatusCode: HttpStatusCode.Forbidden },
+                            isForbidden: forbidden,
                             retryingWithReplacementToken: retryingWithReplacementToken,
                             canRetry: attempts + 1 < maxAttempts,
                             refreshTokenAsync: tokenCancellationToken =>
@@ -312,6 +316,14 @@ public class SteamContentClient : IAsyncDisposable
                     {
                         serverLeaseForAuthRetry = serverLease;
                         retainServerForRetry = true;
+                    }
+                    else
+                    {
+                        disposition = CdnAuthRecoveryPolicy.ApplyRecoveryDisposition(
+                            disposition,
+                            forbidden,
+                            recoveryAction,
+                            () => operationLease.ExcludeServer(server));
                     }
                 }
 
@@ -465,8 +477,8 @@ public class SteamContentClient : IAsyncDisposable
     {
         var token = GetCdnAuthToken(depotId, server);
 
-        // Reuse any valid cached token.
-        if (!string.IsNullOrWhiteSpace(token))
+        // Reuse any cached response, including a successful empty-token response.
+        if (token is not null)
         {
             return token;
         }
@@ -479,16 +491,20 @@ public class SteamContentClient : IAsyncDisposable
             return null;
         }
 
-        var refreshed = await RefreshCdnAuthTokenAsync(
+        await RefreshCdnAuthTokenAsync(
             appId,
             depotId,
             server,
             rejectedToken: null,
             cancellationToken).ConfigureAwait(false);
 
-        if (refreshed)
+        // Check the cache even when no non-empty token was returned.
+        // An empty string represents a successfully cached response.
+        token = GetCdnAuthToken(depotId, server);
+
+        if (token is not null)
         {
-            return GetCdnAuthToken(depotId, server);
+            return token;
         }
 
         Logger?.LogDebug(
@@ -519,8 +535,10 @@ public class SteamContentClient : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Called after a CDN server answered 403. Returns true if the request is worth retrying on this server
-    ///     (a new token is available), false if the server should be dropped.
+    ///     Called after a CDN server answers 403. Returns true if the request
+    ///     can be retried on the same server with a replacement authentication
+    ///     token. Returns false if recovery fails and the current operation
+    ///     should exclude that host.rth retrying on this server
     /// </summary>
     internal async Task<bool> RefreshCdnAuthTokenAsync(
         AppId appId,
@@ -539,7 +557,7 @@ public class SteamContentClient : IAsyncDisposable
 
         // One request at a time, so many workers failing together only ask Steam once.
         // A valid token that is not the rejected one means another worker already refreshed it.
-        return await _cdnAuthTokenCache.RefreshAsync(
+        var refreshed = await _cdnAuthTokenCache.RefreshAsync(
             CdnKey(depotId, host),
             rejectedToken,
             async tokenCancellationToken =>
@@ -551,19 +569,19 @@ public class SteamContentClient : IAsyncDisposable
                         .WaitAsync(tokenCancellationToken)
                         .ConfigureAwait(false);
 
-                    var hasToken = !string.IsNullOrWhiteSpace(auth.Token);
-
-                    if (auth.Result != SteamKit.EResult.OK || !hasToken)
+                    if (auth.Result != SteamKit.EResult.OK)
                     {
                         Logger?.LogWarning(
-                            "CDN auth refresh for depot {DepotId} via {Host} failed: Steam result {Result}; token returned: {HasToken}.",
+                            "CDN auth refresh for depot {DepotId} via {Host} failed: Steam result {Result}.",
                             depotId,
                             host,
-                            auth.Result,
-                            hasToken);
+                            auth.Result);
 
                         return null;
                     }
+
+                    var token = auth.Token ?? string.Empty;
+                    var hasToken = !string.IsNullOrWhiteSpace(token);
 
                     Logger?.LogDebug(
                         "CDN auth refresh for depot {DepotId} via {Host}: Steam result {Result}; token returned: {HasToken}; expiration: {Expiration}.",
@@ -593,6 +611,9 @@ public class SteamContentClient : IAsyncDisposable
                 }
             },
             cancellationToken).ConfigureAwait(false);
+
+        return refreshed &&
+                !string.IsNullOrWhiteSpace(GetCdnAuthToken(depotId, server));
     }
 
     public async Task<byte[]> GetDepotKeyAsync(DepotId depotId, AppId appId)
