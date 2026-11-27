@@ -49,6 +49,11 @@ public class SteamContentClient : IAsyncDisposable
     private readonly ConcurrentDictionary<AppId, SteamCdnServerPool> _serverPools = new();
 
     private readonly AsyncLock _serverPoolsLock = new();
+
+    // Retired pool disposals are tracked until completion.
+    // Accessed under _serverPoolsLock.
+    private readonly HashSet<Task> _retiredPoolDisposals = new();
+
     private readonly object _disposeLock = new();
     private Task? _disposeTask;
     private bool _disposeStarted;
@@ -110,6 +115,7 @@ public class SteamContentClient : IAsyncDisposable
     private async Task DisposeCoreAsync()
     {
         List<SteamCdnServerPool> pools;
+        List<Task> retiredPoolDisposals;
 
         {
             using var lk = await _serverPoolsLock.LockAsync().ConfigureAwait(false);
@@ -117,6 +123,7 @@ public class SteamContentClient : IAsyncDisposable
             _disposeStarted = true;
 
             pools = _serverPools.Values.ToList();
+            retiredPoolDisposals = _retiredPoolDisposals.ToList();
 
             _serverPools.Clear();
         }
@@ -126,7 +133,8 @@ public class SteamContentClient : IAsyncDisposable
         try
         {
             await Task.WhenAll(
-                pools.Select(pool => pool.DisposeAsync().AsTask()))
+                pools.Select(pool => pool.DisposeAsync().AsTask())
+                    .Concat(retiredPoolDisposals))
                 .ConfigureAwait(false);
         }
         finally
@@ -366,6 +374,7 @@ public class SteamContentClient : IAsyncDisposable
     {
         SteamCdnServerPool serverPool;
         SteamCdnServerPool? replacedPool = null;
+        TaskCompletionSource<bool>? replacedPoolDisposal = null;
 
         using (await _serverPoolsLock.LockAsync(cancellationToken))
         {
@@ -380,29 +389,56 @@ public class SteamContentClient : IAsyncDisposable
 
                 // The pool gave up because Steam returned no servers. Replace it so later calls can try again.
                 replacedPool = existingPool;
+
+                // Register before releasing the lock so client disposal
+                // cannot miss the retired pool.
+                replacedPoolDisposal = new(
+                    TaskCreationOptions.RunContinuationsAsynchronously);
+
+                _retiredPoolDisposals.Add(replacedPoolDisposal.Task);
             }
 
             serverPool = CdnPoolFactory?.Invoke(appId)
                         ?? new SteamCdnServerPool(this, appId) { Logger = Logger };
             _serverPools[appId] = serverPool;
         }
-
-        if (replacedPool != null)
+        // Start disposal outside the lookup lock.
+        if (replacedPool != null && replacedPoolDisposal != null)
         {
             // Disposal waits for work admitted on the old pool. That must never happen while holding the
             // lock, because every other lookup, for any app, would wait behind it.
-            _ = DisposeReplacedPoolAsync(replacedPool);
+            _ = DisposeReplacedPoolAsync(replacedPool, replacedPoolDisposal);
         }
 
         return serverPool;
     }
 
-    private async Task DisposeReplacedPoolAsync(SteamCdnServerPool pool)
+    private async Task DisposeReplacedPoolAsync(
+        SteamCdnServerPool pool,
+        TaskCompletionSource<bool> disposalCompletion)
     {
         try
-        { await pool.DisposeAsync().ConfigureAwait(false); }
+        { 
+            await pool.DisposeAsync().ConfigureAwait(false);
+        }
         catch (Exception ex)
-        { Logger?.LogWarning(ex, "Disposing a replaced CDN server pool failed."); }
+        { 
+            Logger?.LogWarning(ex, "Disposing a replaced CDN server pool failed.");
+        }
+        finally
+        {
+            try
+            {
+                using (await _serverPoolsLock.LockAsync().ConfigureAwait(false))
+                {
+                    _retiredPoolDisposals.Remove(disposalCompletion.Task);
+                }
+            }
+            finally
+            {
+                disposalCompletion.TrySetResult(true);
+            }
+        }
     }
 
     private static string CdnKey(DepotId depotId, string host) =>

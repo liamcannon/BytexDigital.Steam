@@ -140,6 +140,37 @@ public class SteamContentClientTests
     }
 
     [Fact]
+    public async Task ClientDisposalWaitsForRetiredPoolDisposal()
+    {
+        await using var fixture = new ClientFixture();
+
+        var retiredPool =
+            await fixture.Client.GetSteamCdnServerPoolAsync(App);
+
+        using var lease = retiredPool.BeginCdnOperation();
+
+        retiredPool.IsExhausted = true;
+
+        var replacementPool =
+            await fixture.Client.GetSteamCdnServerPoolAsync(App);
+
+        Assert.NotSame(retiredPool, replacementPool);
+
+        // The old pool has started disposing and will not accept new work.
+        Assert.Throws<ObjectDisposedException>(
+            () => retiredPool.BeginCdnOperation());
+
+        var disposal = fixture.Client.DisposeAsync().AsTask();
+
+        // Parent disposal must wait for the retired pool.
+        Assert.False(disposal.IsCompleted);
+
+        lease.Dispose();
+
+        await disposal.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
     public async Task ReplacingAPoolDoesNotHoldTheLookupLockWhileItDisposes()
     {
         await using var fixture = new ClientFixture();
