@@ -226,4 +226,4 @@ internal sealed class CdnAuthTokenCache
         DateTime RetryAfter);
 
     internal sealed record Entry(string? Token, DateTime Expiration);
-    }
+}

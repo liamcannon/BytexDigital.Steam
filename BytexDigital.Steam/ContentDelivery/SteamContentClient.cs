@@ -188,7 +188,8 @@ public class SteamContentClient : IAsyncDisposable
                 cancellationToken.ThrowIfCancellationRequested();
                 serverLease ??= pool.GetServerForDownload(
                     cancellationToken,
-                    allowRecoveryProbe: !recoveryProbeAttempted);
+                    allowRecoveryProbe: !recoveryProbeAttempted,
+                    operationLease: operationLease);
                 server = serverLease.Value.Server;
 
                 if (serverLease.Value.RecoveryProbe.HasValue)
@@ -277,12 +278,15 @@ public class SteamContentClient : IAsyncDisposable
                 {
                     CdnAuthRecoveryAction recoveryAction;
 
+                    var forbidden = server.Type == "CDN" &&
+                        ex is SteamKit.SteamKitWebRequestException
+                            { StatusCode: HttpStatusCode.Forbidden };
+
                     try
                     {
                         recoveryAction = await CdnAuthRecoveryPolicy.HandleForbiddenAsync(
                             isCdnServer: server.Type == "CDN",
-                            isForbidden: ex is SteamKit.SteamKitWebRequestException
-                                { StatusCode: HttpStatusCode.Forbidden },
+                            isForbidden: forbidden,
                             retryingWithReplacementToken: retryingWithReplacementToken,
                             canRetry: attempts + 1 < maxAttempts,
                             refreshTokenAsync: tokenCancellationToken =>
@@ -312,6 +316,14 @@ public class SteamContentClient : IAsyncDisposable
                     {
                         serverLeaseForAuthRetry = serverLease;
                         retainServerForRetry = true;
+                    }
+                    else
+                    {
+                        disposition = CdnAuthRecoveryPolicy.ApplyRecoveryDisposition(
+                            disposition,
+                            forbidden,
+                            recoveryAction,
+                            () => operationLease.ExcludeServer(server));
                     }
                 }
 
@@ -523,8 +535,10 @@ public class SteamContentClient : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Called after a CDN server answered 403. Returns true if the request is worth retrying on this server
-    ///     (a new token is available), false if the server should be dropped.
+    ///     Called after a CDN server answers 403. Returns true if the request
+    ///     can be retried on the same server with a replacement authentication
+    ///     token. Returns false if recovery fails and the current operation
+    ///     should exclude that host.rth retrying on this server
     /// </summary>
     internal async Task<bool> RefreshCdnAuthTokenAsync(
         AppId appId,

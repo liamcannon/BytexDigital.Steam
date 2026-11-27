@@ -253,6 +253,96 @@ public class SteamCdnServerPoolTests
     }
 
     [Fact]
+    public void ExcludedServerIsSkippedForOneOperationButRemainsAvailableToOthers()
+    {
+        using var fixture = new PoolFixture();
+
+        using var firstOperation = fixture.Pool.BeginCdnOperation();
+
+        var first = fixture.Pool.GetServerForDownload(
+            allowRecoveryProbe: false,
+            operationLease: firstOperation);
+
+        firstOperation.ExcludeServer(first.Server);
+
+        fixture.Pool.ReturnServer(first, CdnServerDisposition.Abandoned);
+
+        var next = fixture.Pool.GetServerForDownload(
+            allowRecoveryProbe: false,
+            operationLease: firstOperation);
+
+        Assert.NotEqual(first.Server.Host, next.Server.Host);
+
+        fixture.Pool.ReturnServer(next, CdnServerDisposition.Abandoned);
+
+        using var secondOperation = fixture.Pool.BeginCdnOperation();
+
+        var otherFirst = fixture.Pool.GetServerForDownload(
+            allowRecoveryProbe: false,
+            operationLease: secondOperation);
+
+        var otherSecond = fixture.Pool.GetServerForDownload(
+            allowRecoveryProbe: false,
+            operationLease: secondOperation);
+
+        Assert.Contains(
+            first.Server.Host,
+            new[] { otherFirst.Server.Host, otherSecond.Server.Host });
+    }
+
+    [Fact]
+    public void AllExcludedServersFailSelectionButRemainAvailableToOtherOperations()
+    {
+        using var fixture = new PoolFixture();
+
+        using var firstOperation = fixture.Pool.BeginCdnOperation();
+
+        firstOperation.ExcludeServer(fixture.FirstServer);
+        firstOperation.ExcludeServer(fixture.SecondServer);
+
+        Assert.Throws<
+            BytexDigital.Steam.ContentDelivery.Exceptions.SteamNoContentServerFoundException>(
+            () => fixture.Pool.GetServerForDownload(
+                allowRecoveryProbe: false,
+                operationLease: firstOperation));
+
+        using var secondOperation = fixture.Pool.BeginCdnOperation();
+
+        var first = fixture.Pool.GetServerForDownload(
+            allowRecoveryProbe: false,
+            operationLease: secondOperation);
+
+        var second = fixture.Pool.GetServerForDownload(
+            allowRecoveryProbe: false,
+            operationLease: secondOperation);
+
+        Assert.Contains(
+            fixture.FirstServer.Host,
+            new[] { first.Server.Host, second.Server.Host });
+
+        Assert.Contains(
+            fixture.SecondServer.Host,
+            new[] { first.Server.Host, second.Server.Host });
+    }
+
+    [Fact]
+    public void ServerExclusionsAreScopedToCdnOperation()
+    {
+        using var fixture = new PoolFixture();
+
+        using var firstOperation = fixture.Pool.BeginCdnOperation();
+        using var secondOperation = fixture.Pool.BeginCdnOperation();
+
+        firstOperation.ExcludeServer(fixture.FirstServer);
+
+        Assert.True(firstOperation.IsServerExcluded(fixture.FirstServer));
+
+        Assert.False(secondOperation.IsServerExcluded(fixture.FirstServer));
+
+        Assert.False(firstOperation.IsServerExcluded(fixture.SecondServer));
+    }
+
+    [Fact]
     public void DoesNotSelectDroppedServerDuringNormalSelection()
     {
         using var fixture = new PoolFixture();

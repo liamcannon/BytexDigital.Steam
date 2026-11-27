@@ -305,82 +305,134 @@ namespace BytexDigital.Steam.ContentDelivery
         /// </summary>
         internal CdnServerLease GetServerForDownload(
             CancellationToken cancellationToken = default,
-            bool allowRecoveryProbe = true)
+            bool allowRecoveryProbe = true,
+            CdnOperationLease? operationLease = null)
         {
-            return GetServerCore(cancellationToken, allowRecoveryProbe);
+            return GetServerCore(
+                cancellationToken,
+                allowRecoveryProbe,
+                operationLease);
         }
 
-        private CdnServerLease GetServerCore(CancellationToken cancellationToken, bool allowRecoveryProbe)
+        private CdnServerLease GetServerCore(
+            CancellationToken cancellationToken,
+            bool allowRecoveryProbe,
+            CdnOperationLease? operationLease = null)
         {
-            while (true)
+            var temporarilySkipped = new List<Server>();
+
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // Recovery uses the next real download operation as its probe. This avoids synthetic pings
-                // and tests the endpoint with the actual depot/manifest/chunk and authentication context.
-                if (allowRecoveryProbe && !IsInExhaustionFallback &&
-                    TryGetRecoveryProbe(out var probeServer, out var probeLease))
+                while (true)
                 {
-                    return new CdnServerLease(probeServer, probeLease);
-                }
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                Server? server;
-                if (!_activeServerEndpoints.TryPop(out server))
-                {
-                    if (NeedsPopulation && _populatedEvent.IsSet)
+                    // Recovery uses the next real download operation as its probe. This avoids synthetic pings
+                    // and tests the endpoint with the actual depot/manifest/chunk and authentication context.
+                    if (allowRecoveryProbe &&
+                        !IsInExhaustionFallback &&
+                        TryGetRecoveryProbe(
+                            out var probeServer,
+                            out var probeLease,
+                            operationLease))
                     {
-                        Logger?.LogTrace("GetServer: Set populatePoolEvent");
-                        _populatePoolEvent.Set();
+                        return new CdnServerLease(probeServer, probeLease);
                     }
 
-                    // Stops waiting when the caller cancels OR when the pool is closed or gives up.
-                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _token);
-
-                    try
+                    Server? server;
+                    if (!_activeServerEndpoints.TryPop(out server))
                     {
-                        server = _availableServerEndpoints.Take(linked.Token);
-                    }
-                    catch (OperationCanceledException) when (IsExhausted && !cancellationToken.IsCancellationRequested)
-                    {
-                        throw new SteamNoContentServerFoundException(_appId);
-                    }
-                }
+                        if (NeedsPopulation && _populatedEvent.IsSet)
+                        {
+                            Logger?.LogTrace("GetServer: Set populatePoolEvent");
+                            _populatePoolEvent.Set();
+                        }
 
-                if (server == null)
-                {
-                    continue;
-                }
+                        // Stops waiting when the caller cancels OR when the pool is closed or gives up.
+                        using var linked =
+                            CancellationTokenSource.CreateLinkedTokenSource(
+                                cancellationToken,
+                                _token);
 
-                var key = ServerKey(server);
-                var isDropped = _droppedServers.IsDropped(key);
-
-                // Old copies can remain in either collection after a server is dropped. In normal mode
-                // they must be skipped. In exhaustion fallback, trying them again is intentional.
-                if (isDropped && !IsInExhaustionFallback)
-                {
-                    // A drop may have raced with the first probe check above. Try to acquire its lease now.
-                    if (allowRecoveryProbe && _droppedServers.TryBeginRecoveryProbe(key, out var lateProbeLease))
-                    {
-                        return new CdnServerLease(server, lateProbeLease);
+                        try
+                        {
+                            server = _availableServerEndpoints.Take(linked.Token);
+                        }
+                        catch (OperationCanceledException)
+                            when (IsExhausted &&
+                                !cancellationToken.IsCancellationRequested)
+                        {
+                            throw new SteamNoContentServerFoundException(_appId);
+                        }
                     }
 
-                    continue;
-                }
+                    if (server == null)
+                    {
+                        continue;
+                    }
 
-                RecoveryProbeLease? fallbackProbeLease = null;
-                if (isDropped && allowRecoveryProbe &&
-                    _droppedServers.TryBeginRecoveryProbe(key, out var currentProbeLease))
+                    // Exclusions belong to this operation only.
+                    // Hold excluded servers temporarily rather than removing them
+                    // from the shared pool.
+                    if (operationLease?.IsServerExcluded(server) == true)
+                    {
+                        temporarilySkipped.Add(server);
+
+                        var knownServers = Volatile.Read(ref _knownServerEndpoints);
+
+                        if (knownServers.Length > 0 &&
+                            knownServers.All(operationLease.IsServerExcluded))
+					    {
+                            throw new SteamNoContentServerFoundException(_appId);
+                        }
+                        continue;
+                    }
+
+                    var key = ServerKey(server);
+                    var isDropped = _droppedServers.IsDropped(key);
+
+                    // Old copies can remain in either collection after a server is dropped. In normal mode
+                    // they must be skipped. In exhaustion fallback, trying them again is intentional.
+                    if (isDropped && !IsInExhaustionFallback)
+                    {
+                        // A drop may have raced with the first probe check above. Try to acquire its lease now.
+                        if (allowRecoveryProbe && _droppedServers.TryBeginRecoveryProbe(key, out var lateProbeLease))
+                        {
+                            return new CdnServerLease(server, lateProbeLease);
+                        }
+                        continue;
+                    }
+
+                    RecoveryProbeLease? fallbackProbeLease = null;
+                    if (isDropped &&
+                        allowRecoveryProbe &&
+                        _droppedServers.TryBeginRecoveryProbe(
+                            key,
+                            out var currentProbeLease))
+                    {
+                        // A fallback selection is still allowed when a probe is not due. If it is due, attach
+                        // the lease so a failed real attempt advances the probe backoff correctly.
+                        fallbackProbeLease = currentProbeLease;
+                    }
+
+                    return new CdnServerLease(server, fallbackProbeLease);
+                }
+            }
+            finally
+            {
+                // Restore every temporarily skipped server to the shared pool,
+                // including when selection is cancelled or fails.
+                foreach (var skippedServer in temporarilySkipped)
                 {
-                    // A fallback selection is still allowed when a probe is not due. If it is due, attach
-                    // the lease so a failed real attempt advances the probe backoff correctly.
-                    fallbackProbeLease = currentProbeLease;
+                    _activeServerEndpoints.Push(skippedServer);
                 }
-
-                return new CdnServerLease(server, fallbackProbeLease);
             }
         }
 
-        private bool TryGetRecoveryProbe(out Server server, out RecoveryProbeLease lease)
+        private bool TryGetRecoveryProbe(
+            out Server server,
+            out RecoveryProbeLease lease,
+            CdnOperationLease? operationLease = null)
         {
             var candidates = Volatile.Read(ref _knownServerEndpoints)
                 .OrderBy(x => x.WeightedLoad)
@@ -401,6 +453,10 @@ namespace BytexDigital.Steam.ContentDelivery
             {
                 var candidate = candidates[(start + offset) % candidates.Length];
                 var key = ServerKey(candidate);
+                if (operationLease?.IsServerExcluded(candidate) == true)
+                {
+                    continue;
+                }
                 if (!_droppedServers.TryBeginRecoveryProbe(key, out lease))
                 {
                     continue;
@@ -760,11 +816,34 @@ namespace BytexDigital.Steam.ContentDelivery
     internal sealed class CdnOperationLease : IDisposable
     {
         private readonly SteamCdnServerPool _owner;
+        private readonly object _exclusionLock = new();
+        private readonly HashSet<string> _excludedServerKeys = new(StringComparer.Ordinal);
+
         private bool _isDisposed;
 
         internal CdnOperationLease(SteamCdnServerPool owner)
         {
             _owner = owner;
+        }
+
+        internal void ExcludeServer(Server server)
+        {
+            ArgumentNullException.ThrowIfNull(server);
+
+            lock (_exclusionLock)
+            {
+                _excludedServerKeys.Add($"{server.Type}:{server.Host}");
+            }
+        }
+
+        internal bool IsServerExcluded(Server server)
+        {
+            ArgumentNullException.ThrowIfNull(server);
+
+            lock (_exclusionLock)
+            {
+                return _excludedServerKeys.Contains($"{server.Type}:{server.Host}");
+            }
         }
 
         internal bool BelongsTo(SteamCdnServerPool pool)
